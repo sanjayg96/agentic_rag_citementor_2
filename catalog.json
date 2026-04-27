@@ -1,0 +1,56 @@
+{
+  "book_001": {
+    "title": "Rich Dad Poor Dad",
+    "author": "Robert Kiyosaki",
+    "genre": "finance",
+    "retail_price": 22.99,
+    "total_chunks": 576,
+    "currency": "USD",
+    "file_name": "Rich Dad Poor Dad.pdf"
+  },
+  "book_002": {
+    "title": "The Psychology of Money",
+    "author": "Morgan Housel",
+    "genre": "finance",
+    "retail_price": 19.99,
+    "total_chunks": 516,
+    "currency": "USD",
+    "file_name": "The Psychology of Money.pdf"
+  },
+  "book_003": {
+    "title": "101 Ways to Build Happy, Lasting Relationships",
+    "author": "Emotional Affair Journey",
+    "genre": "relationships",
+    "retail_price": 29.99,
+    "total_chunks": 95,
+    "currency": "USD",
+    "file_name": "101 Ways to Build Happy, Lasting Relationships.pdf"
+  },
+  "book_004": {
+    "title": "Men are from Mars, Women are from Venus",
+    "author": "John Gray",
+    "genre": "relationships",
+    "retail_price": 29.99,
+    "total_chunks": 811,
+    "currency": "USD",
+    "file_name": "Men are from Mars, Women are from Venus.pdf"
+  },
+  "book_005": {
+    "title": "How to Win Friends and Influence People",
+    "author": "Dale Carnegie",
+    "genre": "relationships",
+    "retail_price": 29.99,
+    "total_chunks": 737,
+    "currency": "USD",
+    "file_name": "How to Win Friends and Influence People.pdf"
+  },
+  "book_006": {
+    "title": "As a Man Thinketh",
+    "author": "James Allen",
+    "genre": "philosophy",
+    "retail_price": 29.99,
+    "total_chunks": 65,
+    "currency": "USD",
+    "file_name": "As a Man Thinketh.pdf"
+  }
+}
