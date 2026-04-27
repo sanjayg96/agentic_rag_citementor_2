@@ -1,0 +1,18 @@
+system:
+  # Toggle this between "openai" and "local" to switch inference engines instantly
+  inference_mode: "openai"
+  # inference_mode: "local" 
+  local_llm: "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+  embedding_model: "nomic-ai/nomic-embed-text-v1.5"
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+retrieval:
+  semantic_top_k: 10
+  lexical_top_k: 10
+  bm25_weight: 0.3
+  vector_weight: 0.7
+  rrf_k: 60
+  final_top_n: 3 # The exact number of chunks passed to the LLM synthesis
+
+cache:
+  similarity_threshold: 0.88 # 88% semantic similarity required to trigger a cache hit
