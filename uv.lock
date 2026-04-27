@@ -314,6 +314,7 @@ version = "2.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "chromadb" },
+    { name = "datasets" },
     { name = "einops" },
     { name = "langchain" },
     { name = "langchain-openai" },
@@ -333,6 +334,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chromadb", specifier = ">=0.4.24" },
+    { name = "datasets", specifier = ">=4.8.4" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "langchain", specifier = ">=0.1.13" },
     { name = "langchain-openai", specifier = ">=0.1.1" },
