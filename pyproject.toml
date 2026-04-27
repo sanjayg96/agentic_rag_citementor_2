@@ -20,4 +20,5 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "einops>=0.8.2",
     "torchvision>=0.26.0",
+    "datasets>=4.8.4",
 ]
