@@ -19,6 +19,7 @@ st.set_page_config(
 pages = {
     "Mentorship Engine": [
         st.Page("pages/1_Mentor.py", title="Mentor Chat", icon="💬"),
+        st.Page("pages/4_About.py", title="About CiteMentor", icon="🧭"),
     ],
     "System Observability": [
         st.Page("pages/2_Dashboard.py", title="RAG Dashboard", icon="📊"),

@@ -1,9 +1,7 @@
 import yaml
+from functools import lru_cache
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from mlx_lm import load, generate
-from src.core.retriever import HybridRetriever
 from src.core.guardrails import check_input_safety
 import json
 
@@ -17,8 +15,31 @@ with open("config/retrieval.yaml", "r") as f:
 with open("prompts.yaml", "r") as f:
     prompts = yaml.safe_load(f)
 
-# Initialize Retriever globally so it doesn't reload heavily on each graph run
-retriever_engine = HybridRetriever()
+@lru_cache(maxsize=1)
+def get_retriever():
+    """Initializes retrieval resources only when the first RAG query needs them."""
+    from src.core.retriever import HybridRetriever
+
+    return HybridRetriever()
+
+@lru_cache(maxsize=1)
+def get_local_llm():
+    """Keeps the MLX model resident after the first local generation call."""
+    from mlx_lm import load
+
+    return load(config["system"]["local_llm"])
+
+@lru_cache(maxsize=None)
+def get_openai_llm(model_name: str):
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(model=model_name, temperature=0)
+
+def local_generate(prompt: str, max_tokens: int) -> str:
+    from mlx_lm import generate
+
+    model, tokenizer = get_local_llm()
+    return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
 
 # 1. Define State
 class AgentState(TypedDict):
@@ -43,20 +64,25 @@ def router_node(state: AgentState):
     """Classifies the domain and generates semantic expansions."""
     query = state["query"]
     router_prompt = prompts["router"].format(query=query)
-    expansion_prompt = prompts["query_expansion"].format(query=query)
     
     if config["system"]["inference_mode"] == "openai":
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = get_openai_llm(config["openai"]["router_model"])
         route = llm.invoke(router_prompt).content.strip().lower()
-        expansions_raw = llm.invoke(expansion_prompt).content.strip()
     else:
         # Local MLX Execution
-        model, tokenizer = load(config["system"]["local_llm"])
-        route = generate(model, tokenizer, prompt=router_prompt, max_tokens=15).strip().lower()
-        expansions_raw = generate(model, tokenizer, prompt=expansion_prompt, max_tokens=60).strip()
+        route = local_generate(router_prompt, max_tokens=15).strip().lower()
         
-    valid_routes = ["finance", "relationships", "philosophy", "out_of_scope"]
+    valid_routes = ["finance", "relationships", "philosophy", "out_of_scope", "greeting"]
     final_route = route if route in valid_routes else "in_scope"
+
+    if final_route in {"greeting", "out_of_scope"}:
+        return {"route": final_route, "expanded_queries": [query]}
+
+    expansion_prompt = prompts["query_expansion"].format(query=query)
+    if config["system"]["inference_mode"] == "openai":
+        expansions_raw = get_openai_llm(config["openai"]["query_expansion_model"]).invoke(expansion_prompt).content.strip()
+    else:
+        expansions_raw = local_generate(expansion_prompt, max_tokens=60).strip()
     
     expanded = expansions_raw.split("|")
     expanded = [e.strip() for e in expanded if e.strip()]
@@ -67,6 +93,7 @@ def router_node(state: AgentState):
 
 def retriever_node(state: AgentState):
     """Executes the Hybrid Search & RRF."""
+    retriever_engine = get_retriever()
     chunks = retriever_engine.retrieve(state["expanded_queries"])
     return {"retrieved_chunks": chunks}
 
@@ -85,12 +112,11 @@ def synthesis_node(state: AgentState):
     formatted_prompt = prompts["synthesis"].format(context=context, query=state["query"])
     
     if config["system"]["inference_mode"] == "openai":
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = get_openai_llm(config["openai"]["synthesis_model"])
         answer = llm.invoke(formatted_prompt).content
     else:
         # Local MLX Execution
-        model, tokenizer = load(config["system"]["local_llm"])
-        answer = generate(model, tokenizer, prompt=formatted_prompt, max_tokens=1024, verbose=False)
+        answer = local_generate(formatted_prompt, max_tokens=1024)
         
     return {"answer": answer}
 

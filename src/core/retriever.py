@@ -1,10 +1,13 @@
+import json
+import re
 import yaml
 import pickle
 from pathlib import Path
 from typing import List, Dict, Any
 import chromadb
-from chromadb.utils import embedding_functions
-from sentence_transformers import CrossEncoder
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Paths
 CONFIG_PATH = Path("config/retrieval.yaml")
@@ -17,30 +20,74 @@ class HybridRetriever:
             self.config = yaml.safe_load(f)
             
         self.retrieval_cfg = self.config["retrieval"]
+        self.inference_mode = self.config["system"].get("inference_mode", "local")
         
-        # 1. Initialize Embeddings (Must match ingestion model)
-        self.emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=self.config["system"]["embedding_model"],
-            trust_remote_code=True
-        )
-        
-        # 2. Connect to ChromaDB
+        # 1. Connect to the collection that matches the active embedding space.
         self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        collection_name = self.config["vector_stores"]["local_collection"]
+        if self.inference_mode == "openai":
+            collection_name = self.config["vector_stores"]["openai_collection"]
+
+        collection_kwargs = {"name": collection_name}
+        if self.inference_mode == "local":
+            from chromadb.utils import embedding_functions
+
+            self.emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=self.config["system"]["embedding_model"],
+                trust_remote_code=True
+            )
+            collection_kwargs["embedding_function"] = self.emb_fn
+        elif self.inference_mode == "openai":
+            from chromadb.utils import embedding_functions
+
+            api_key = self._get_openai_api_key()
+            self.emb_fn = embedding_functions.OpenAIEmbeddingFunction(
+                api_key=api_key,
+                model_name=self.config["openai"]["embedding_model"]
+            )
+            collection_kwargs["embedding_function"] = self.emb_fn
+
         self.collection = self.chroma_client.get_or_create_collection(
-            name="citementor_library",
-            embedding_function=self.emb_fn
+            **collection_kwargs
         )
         
-        # 3. Load BM25 Index
+        # 2. Load BM25 Index
         with open(BM25_DIR, "rb") as f:
             bm25_data = pickle.load(f)
             self.bm25_model = bm25_data["model"]
             self.bm25_metadata = bm25_data["metadata"]
             
-        # 4. Load Cross-Encoder for Reranking
-        # This small local model re-scores chunks for maximum relevance
-        print(f"Loading Cross-Encoder: {self.config['system']['reranker_model']}...")
-        self.cross_encoder = CrossEncoder(self.config["system"]["reranker_model"])
+        # 3. Local cross-encoder is loaded lazily and only in local mode.
+        self._cross_encoder = None
+        self._openai_reranker = None
+
+    @property
+    def cross_encoder(self):
+        if self._cross_encoder is None:
+            from sentence_transformers import CrossEncoder
+
+            print(f"Loading Cross-Encoder: {self.config['system']['reranker_model']}...")
+            self._cross_encoder = CrossEncoder(self.config["system"]["reranker_model"])
+        return self._cross_encoder
+
+    @property
+    def openai_reranker(self):
+        if self._openai_reranker is None:
+            from langchain_openai import ChatOpenAI
+
+            self._openai_reranker = ChatOpenAI(
+                model=self.config["openai"]["reranker_model"],
+                temperature=0
+            )
+        return self._openai_reranker
+
+    def _get_openai_api_key(self) -> str:
+        import os
+
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("CHROMA_OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when inference_mode is set to openai.")
+        return api_key
 
     def _reciprocal_rank_fusion(self, vector_results: List[Dict], bm25_results: List[Dict]) -> List[Dict]:
         """Fuses ranked lists using the RRF formula."""
@@ -94,18 +141,31 @@ class HybridRetriever:
             tokenized_query = query.split()
             bm25_scores = self.bm25_model.get_scores(tokenized_query)
             top_n_indices = bm25_scores.argsort()[::-1][:self.retrieval_cfg["lexical_top_k"]]
-            
+
+            candidate_metadata = []
+            missing_ids = []
             for idx in top_n_indices:
                 meta = self.bm25_metadata[idx]
                 chunk_id = f"{meta['book_id']}_chunk_{meta['chunk_index']}"
-                
+
                 if chunk_id not in seen_bm25_ids:
-                    # Fetch actual text from Chroma to avoid storing it twice on disk
-                    fetch_res = self.collection.get(ids=[chunk_id])
-                    if fetch_res and fetch_res["documents"]:
+                    candidate_metadata.append((chunk_id, meta))
+                    missing_ids.append(chunk_id)
+
+            # Fetch BM25 documents from Chroma in one batch instead of one DB call per hit.
+            if missing_ids:
+                fetch_res = self.collection.get(ids=missing_ids)
+                documents_by_id = {
+                    chunk_id: document
+                    for chunk_id, document in zip(fetch_res.get("ids", []), fetch_res.get("documents", []))
+                }
+
+                for chunk_id, meta in candidate_metadata:
+                    document = documents_by_id.get(chunk_id)
+                    if document:
                         all_bm25_results.append({
                             "id": chunk_id,
-                            "text": fetch_res["documents"][0],
+                            "text": document,
                             "book_id": meta["book_id"],
                             "author": meta["author"]
                         })
@@ -117,11 +177,14 @@ class HybridRetriever:
         if not fused_results:
             return []
 
-        # --- D. Cross-Encoder Reranking ---
+        # --- D. Reranking ---
         # Compare every fused chunk against the primary (first) original query
         primary_query = queries[0] 
+        if self.inference_mode == "openai":
+            return self._rerank_with_openai(primary_query, fused_results)
+
         cross_inp = [[primary_query, item["text"]] for item in fused_results]
-        cross_scores = self.cross_encoder.predict(cross_inp)
+        cross_scores = self.cross_encoder.predict(cross_inp, show_progress_bar=False)
         
         # Attach scores and sort highest to lowest
         for i, score in enumerate(cross_scores):
@@ -131,3 +194,55 @@ class HybridRetriever:
         
         # Return exact Top N defined in config
         return reranked_results[:self.retrieval_cfg["final_top_n"]]
+
+    def _rerank_with_openai(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Uses an OpenAI model as the reranking agent in API-only mode."""
+        final_top_n = self.retrieval_cfg["final_top_n"]
+        candidate_lines = []
+        for item in candidates:
+            snippet = item["text"].replace("\n", " ")[:900]
+            candidate_lines.append(f"- id: {item['id']}\n  text: {snippet}")
+
+        prompt = (
+            "You are the CiteMentor reranking agent. Select the most relevant source chunks "
+            "for answering the user query. Return only valid JSON in this shape: "
+            "{\"ranked_ids\": [\"chunk_id_1\", \"chunk_id_2\"]}.\n\n"
+            f"User query: {query}\n\n"
+            f"Return exactly {min(final_top_n, len(candidates))} ids, ordered from most to least relevant.\n\n"
+            "Candidate chunks:\n"
+            + "\n".join(candidate_lines)
+        )
+
+        try:
+            response = self.openai_reranker.invoke(prompt).content
+            ranked_ids = self._parse_ranked_ids(response)
+        except Exception:
+            ranked_ids = []
+
+        candidate_map = {item["id"]: item for item in candidates}
+        reranked = []
+        for score, chunk_id in enumerate(ranked_ids[::-1], start=1):
+            item = candidate_map.get(chunk_id)
+            if item:
+                item["cross_score"] = float(score)
+                reranked.insert(0, item)
+
+        if len(reranked) < final_top_n:
+            seen = {item["id"] for item in reranked}
+            for item in candidates:
+                if item["id"] not in seen:
+                    item["cross_score"] = 0.0
+                    reranked.append(item)
+                if len(reranked) >= final_top_n:
+                    break
+
+        return reranked[:final_top_n]
+
+    def _parse_ranked_ids(self, response: str) -> List[str]:
+        try:
+            return json.loads(response).get("ranked_ids", [])
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+            if not match:
+                return []
+            return json.loads(match.group(0)).get("ranked_ids", [])
