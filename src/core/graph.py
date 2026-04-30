@@ -2,8 +2,11 @@ import yaml
 from functools import lru_cache
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
+from dotenv import load_dotenv
 from src.core.guardrails import check_input_safety
 import json
+
+load_dotenv()
 
 with open("catalog.json", "r") as f:
     catalog_data = json.load(f)
@@ -40,6 +43,41 @@ def local_generate(prompt: str, max_tokens: int) -> str:
 
     model, tokenizer = get_local_llm()
     return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
+
+def build_synthesis_prompt(state: "AgentState") -> str | None:
+    if not state.get("retrieved_chunks"):
+        return None
+
+    context_parts = []
+    for c in state["retrieved_chunks"]:
+        title = catalog_data.get(c["book_id"], {}).get("title", c["book_id"])
+        context_parts.append(f"[{title}] {c['text']}")
+
+    context = "\n\n".join(context_parts)
+    return prompts["synthesis"].format(context=context, query=state["query"])
+
+def stream_synthesis_answer(state: "AgentState"):
+    """Yields answer text incrementally where the active model supports streaming."""
+    formatted_prompt = build_synthesis_prompt(state)
+    if formatted_prompt is None:
+        yield "I don't have enough information in my library to answer this."
+        return
+
+    if config["system"]["inference_mode"] == "openai":
+        llm = get_openai_llm(config["openai"]["synthesis_model"])
+        for chunk in llm.stream(formatted_prompt):
+            text = chunk.content
+            if text:
+                yield text
+        return
+
+    from mlx_lm import stream_generate
+
+    model, tokenizer = get_local_llm()
+    for chunk in stream_generate(model, tokenizer, prompt=formatted_prompt, max_tokens=1024):
+        text = getattr(chunk, "text", "")
+        if text:
+            yield text
 
 # 1. Define State
 class AgentState(TypedDict):
@@ -99,17 +137,9 @@ def retriever_node(state: AgentState):
 
 def synthesis_node(state: AgentState):
     """Drafts the final response using only the retrieved context."""
-    if not state.get("retrieved_chunks"):
+    formatted_prompt = build_synthesis_prompt(state)
+    if formatted_prompt is None:
         return {"answer": "I don't have enough information in my library to answer this."}
-        
-    # Inject actual book titles into the context instead of book_001
-    context_parts = []
-    for c in state["retrieved_chunks"]:
-        title = catalog_data.get(c["book_id"], {}).get("title", c["book_id"])
-        context_parts.append(f"[{title}] {c['text']}")
-        
-    context = "\n\n".join(context_parts)
-    formatted_prompt = prompts["synthesis"].format(context=context, query=state["query"])
     
     if config["system"]["inference_mode"] == "openai":
         llm = get_openai_llm(config["openai"]["synthesis_model"])
