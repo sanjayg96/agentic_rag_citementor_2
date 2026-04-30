@@ -1,10 +1,28 @@
 system:
   # Toggle this between "openai" and "local" to switch inference engines instantly
-  # inference_mode: "openai"
-  inference_mode: "local" 
+  inference_mode: "openai"
+  # inference_mode: "local" 
   local_llm: "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
   embedding_model: "nomic-ai/nomic-embed-text-v1.5"
   reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+vector_stores:
+  local_collection: "citementor_library"
+  openai_collection: "citementor_library_openai"
+
+openai:
+  # Fast API-only path for demos and Streamlit deployment.
+  # GPT-5 nano handles simple routing, expansion, and candidate reranking.
+  # GPT-5 mini handles final synthesis where answer quality matters more.
+  router_model: "gpt-5-nano"
+  query_expansion_model: "gpt-5-nano"
+  reranker_model: "gpt-5-nano"
+  synthesis_model: "gpt-5-mini"
+  ingestion_context_model: "gpt-5-nano"
+  ingestion_summary_batch_size: 20
+  embedding_model: "text-embedding-3-small"
+  eval_model: "gpt-5-mini"
+  eval_embedding_model: "text-embedding-3-small"
 
 retrieval:
   semantic_top_k: 10

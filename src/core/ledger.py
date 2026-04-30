@@ -1,9 +1,11 @@
 import json
 import os
+from functools import lru_cache
 from typing import Dict, Any
 
 CATALOG_PATH = "catalog.json"
 
+@lru_cache(maxsize=1)
 def load_catalog() -> Dict[str, Any]:
     """Loads the book metadata and pricing catalog."""
     if not os.path.exists(CATALOG_PATH):
