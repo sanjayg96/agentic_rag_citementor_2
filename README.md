@@ -1,11 +1,39 @@
-# CiteMentor 2.0
+# CiteMentor 2.0 | The Attribution-Aware Knowledge Engine
 
-**An attribution-aware, agentic RAG mentorship engine for non-fiction knowledge.**
+### *Pay only for the wisdom you use.*
 
-CiteMentor transforms a curated library of non-fiction books into an interactive
-AI mentor. Instead of giving generic answers, it retrieves relevant source
-passages, synthesizes grounded guidance, shows citations, and tracks a
-micro-royalty-style attribution ledger for the snippets used in each answer.
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://agentic-rag-citementor2.streamlit.app/) ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+
+## Executive Overview
+
+**CiteMentor** is a specialized GenAI platform that transforms static non-fiction libraries into interactive, actionable mentorship. Unlike generic Large Language Models (LLMs) that provide broad, opaque answers, this system utilizes a curated knowledge base of trusted authors to provide grounded advice.
+
+**The Differentiator:** This project introduces a novel economic framework for AI: a **Micro-Royalty System**. It tracks exactly which content is used to generate an answer (down to the paragraph), paving the way for fair author compensation in the age of AI.
+
+---
+
+## The Problem Statement
+
+Current information consumption models are broken for both consumers and creators:
+
+1.  **The "Implementation Gap" (Readers):** People seek advice from books but struggle with volume. Attention spans are shortening; users want solutions, not just 300 pages of text.
+2.  **The "Hallucination Risk" (Generic AI):** Public LLMs often generate convincing but generic or factually incorrect advice. They lack a verifiable "source of truth."
+3.  **The "Black Box" Issue (Authors):** Intellectual property is currently used to train models without consent or compensation. There is no clear mechanism to attribute a specific AI answer to a specific author's work.
+
+## The Solution
+
+An AI-assisted "Mentor" that sits on top of a curated library of high-quality non-fiction.
+
+* **Context-Aware Advisory:** Users ask life/career questions (e.g., *"How do I handle a toxic boss?"*). The system retrieves specific strategies from verified experts.
+* **Verifiable Trust:** Every answer is accompanied by a **"Source Card"** displaying the exact book, author, and snippet used.
+* **The "Fair-Use" Ledger:** A built-in accounting mechanism that calculates cost per query based on the specific chunks retrieved.
+
+| Feature | Benefit to User | Benefit to Ecosystem |
+| :--- | :--- | :--- |
+| **Curated RAG** | High-quality, specific advice. No hallucinations. | Eliminates "noise" from internet-scraped data. |
+| **Citation Engine** | Trust and transparency. You see the evidence. | Drives discovery of original books. |
+| **Royalty Logic** | Users pay fractions of a cent per answer. | Solves the ethical dilemma of AI vs. Copyright. |
+
 
 This is version 2 of the project. Version 1 proved the core idea with a small
 three-book public-domain demo. Version 2 turns it into a fuller applied AI
@@ -13,20 +41,6 @@ engineering portfolio project with local ingestion, LangGraph orchestration,
 hybrid retrieval, guardrails, evals, observability, and deployment-friendly
 OpenAI inference mode.
 
-## Why This Exists
-
-Modern AI advice systems have three major gaps:
-
-1. **Reader gap:** Books contain deep practical wisdom, but people often need a
-   focused answer at the moment they face a decision.
-2. **Trust gap:** Generic LLMs can be fluent while remaining vague, ungrounded,
-   or disconnected from verifiable source material.
-3. **Creator gap:** Authors rarely receive transparent attribution when their
-   ideas influence AI-generated answers.
-
-CiteMentor explores a different pattern: a grounded mentorship interface where
-answers are traceable to specific retrieved passages and source usage is
-measurable.
 
 ## Core Features
 
