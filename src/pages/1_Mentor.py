@@ -1,15 +1,12 @@
 import json
+import yaml
 import streamlit as st
-from datasets import Dataset
-from ragas.metrics import Faithfulness, AnswerRelevancy
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from ragas import evaluate
-
 
 from src.core.graph import app_graph
 from src.core.ledger import record_transaction
+
+with open("config/retrieval.yaml", "r") as f:
+    config = yaml.safe_load(f)
 
 st.title("💬 CiteMentor 2.0")
 st.caption("Agentic Mentorship powered by Local MLX & Hybrid RAG")
@@ -35,7 +32,17 @@ if "ragas_evals" not in st.session_state:
 
 # Sidebar Controls & Ledger
 st.sidebar.markdown("### ⚙️ Controls")
-run_eval = st.sidebar.toggle("🔬 Enable Live RAGAS Eval", value=False, help="Uses OpenAI to grade the response. Adds 5-10s latency.")
+openai_mode = config["system"].get("inference_mode") == "openai"
+run_eval = st.sidebar.toggle(
+    "🔬 Enable Live RAGAS Eval",
+    value=False,
+    disabled=not openai_mode,
+    help=(
+        "Uses OpenAI to grade the response. Adds 5-10s latency."
+        if openai_mode
+        else "Live API evals are disabled in local mode so the full app stays local."
+    )
+)
 
 if st.sidebar.button("🗑️ Reset Session", use_container_width=True):
     st.session_state.clear()
@@ -121,6 +128,13 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
             if run_eval and retrieved_chunks:
                 with st.spinner("🔬 Running RAGAS Evaluation..."):
                     try:
+                        from datasets import Dataset
+                        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+                        from ragas import evaluate
+                        from ragas.embeddings import LangchainEmbeddingsWrapper
+                        from ragas.llms import LangchainLLMWrapper
+                        from ragas.metrics import Faithfulness, AnswerRelevancy
+
                         contexts = [c["text"] for c in retrieved_chunks]
                         
                         # 1. Update to the strict RAGAS v0.2+ Dataset Schema
@@ -132,8 +146,8 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
                         dataset = Dataset.from_dict(eval_data)
                         
                         # Initialize standard Langchain models
-                        base_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-                        base_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+                        base_llm = ChatOpenAI(model=config["openai"]["eval_model"], temperature=0)
+                        base_embeddings = OpenAIEmbeddings(model=config["openai"]["eval_embedding_model"])
                         
                         # Wrap them for RAGAS
                         ragas_llm = LangchainLLMWrapper(base_llm)
