@@ -41,23 +41,27 @@ engineering portfolio project with local ingestion, LangGraph orchestration,
 hybrid retrieval, guardrails, evals, observability, and deployment-friendly
 OpenAI inference mode.
 
+## Architecture
+
+![alt text](architecture_diagram.png)
 
 ## Core Features
 
-- **Agentic RAG workflow:** LangGraph coordinates input guardrails, routing,
-  query expansion, retrieval, reranking, and grounded synthesis.
+- **Agentic RAG workflow:** LangGraph coordinates guardrails, combined routing
+  plus query expansion, retrieval, optional reranking, and grounded synthesis.
 - **Hybrid retrieval:** Combines vector search, BM25 lexical search, reciprocal
   rank fusion, and reranking.
 - **Source cards:** Every standard answer displays the retrieved book snippets
   used as evidence.
 - **Micro-royalty ledger:** Each retrieved snippet contributes a fractional
   cost based on book price and total chunk count.
-- **Observability dashboard:** Tracks live RAGAS scores and logs out-of-scope
-  queries as library gaps.
+- **Observability dashboard:** Tracks live DeepEval scores, per-node latency
+  spans, semantic cache hits, and out-of-scope queries as library gaps.
 - **Local-first mode:** Runs routing, synthesis, embeddings, and reranking
   locally with MLX and local rerankers.
-- **OpenAI demo mode:** Uses OpenAI API models for routing, query expansion,
-  reranking, synthesis, and evals to keep hosted demos fast.
+- **OpenAI demo mode:** Uses OpenAI API models for combined routing/expansion,
+  synthesis, and optional evals while skipping the LLM reranker by default for
+  hosted demo latency.
 
 ## Version 1 to Version 2
 
@@ -68,36 +72,11 @@ OpenAI inference mode.
 | Ingestion | Vector DB created externally on Colab | Local ingestion on Apple Silicon |
 | Orchestration | Basic retrieval flow | LangGraph agent workflow |
 | Retrieval | Core semantic search | Hybrid vector + BM25 + RRF + reranking |
-| Safety | Minimal | Input guardrails |
-| Observability | Minimal | Dashboard, RAGAS evals, gap logging |
+| Safety | Minimal | Input and output guardrails |
+| Observability | Minimal | Dashboard, DeepEval evals, latency spans, cache hits, gap logging |
 | Attribution | Source display | Source display plus micro-royalty ledger |
 | Deployment | Demo-focused | Local mode plus OpenAI API mode |
 
-## Architecture
-
-```text
-User Query
-   |
-   v
-Input Guardrail
-   |
-   v
-Router + Query Expansion
-   |
-   v
-Hybrid Retriever
-   |-- Local mode: Chroma semantic search + BM25 + local cross-encoder
-   |-- OpenAI mode: OpenAI-embedded Chroma search + BM25 + OpenAI reranking agent
-   |
-   v
-Grounded Synthesis
-   |
-   v
-Answer + Source Cards + Royalty Ledger
-   |
-   v
-Observability Dashboard + Library Gap Log
-```
 
 ## Inference Modes
 
@@ -116,17 +95,17 @@ Use this mode when developing on a capable Apple Silicon machine.
 - Chroma queries use the local embedding model that matches ingestion.
 - Reranking uses the local cross-encoder.
 - No OpenAI API call is required for core answering.
-- Live RAGAS evals are disabled in the UI so local mode remains fully local.
+- Live DeepEval evals are disabled in the UI so local mode remains fully local.
 
 ### OpenAI mode
 
 Use this mode for Streamlit deployment or fast demos.
 
-- Router uses `openai.router_model`.
-- Query expansion uses `openai.query_expansion_model`.
-- Reranking uses `openai.reranker_model`.
+- Combined routing and query expansion use `openai.router_model`.
+- Reranking uses reciprocal-rank-fused retrieval by default; set
+  `openai.use_llm_reranker: true` to use `openai.reranker_model`.
 - Final answer synthesis uses `openai.synthesis_model`.
-- RAGAS evals use `openai.eval_model` and `openai.eval_embedding_model`.
+- DeepEval evals use `openai.eval_model`.
 - Local embedding and local cross-encoder models are not loaded.
 - Semantic search uses the `citementor_library_openai` Chroma collection,
   which is embedded with `openai.embedding_model`.
@@ -136,11 +115,10 @@ The default OpenAI choices are optimized for demo latency:
 ```yaml
 openai:
   router_model: "gpt-5-nano"
-  query_expansion_model: "gpt-5-nano"
   reranker_model: "gpt-5-nano"
+  use_llm_reranker: false
   synthesis_model: "gpt-5-mini"
   eval_model: "gpt-5-mini"
-  eval_embedding_model: "text-embedding-3-small"
 ```
 
 ## Tech Stack
@@ -155,7 +133,7 @@ openai:
 - **Local reranking:** `cross-encoder/ms-marco-MiniLM-L-6-v2`
 - **OpenAI models:** Configurable GPT-5 family models and
   `text-embedding-3-small`
-- **Evaluation:** RAGAS
+- **Evaluation:** DeepEval
 
 ## Project Structure
 
@@ -167,12 +145,13 @@ openai:
 │   ├── app.py                  # Streamlit navigation entrypoint
 │   ├── core/
 │   │   ├── graph.py            # LangGraph workflow
-│   │   ├── guardrails.py       # Input safety checks
+│   │   ├── guardrails.py       # Input and output safety checks
 │   │   ├── ledger.py           # Micro-royalty accounting
+│   │   ├── semantic_cache.py   # Persistent semantic answer cache
 │   │   └── retriever.py        # Hybrid retrieval and reranking
 │   ├── pages/
 │   │   ├── 1_Mentor.py         # Chat interface
-│   │   ├── 2_Dashboard.py      # RAGAS and gap observability
+│   │   ├── 2_Dashboard.py      # evaluation, latency, and gap observability
 │   │   ├── 3_Ledger.py         # Royalty ledger page
 │   │   └── 4_About.py          # Portfolio project overview
 │   └── utils/
@@ -194,7 +173,7 @@ Install dependencies with `uv`:
 uv sync
 ```
 
-Create a `.env` file if you plan to use OpenAI mode or live RAGAS evals:
+Create a `.env` file if you plan to use OpenAI mode or live DeepEval evals:
 
 ```bash
 OPENAI_API_KEY=sk-proj-...
@@ -272,7 +251,7 @@ CiteMentor 2.0 is meant to demonstrate production-minded applied AI skills:
 - OpenAI semantic search requires the `citementor_library_openai` collection.
   Run `uv run python -m src.utils.ingestion --profile openai --reset` after
   changing the local collection or adding new books.
-- Guardrails are currently lightweight and input-focused.
+- Guardrails are currently lightweight and pattern-based.
 - The royalty ledger is a prototype accounting mechanism, not a payment system.
-- Live RAGAS evals are useful for demos but should be supplemented with a fixed
+- Live DeepEval evals are useful for demos but should be supplemented with a fixed
   benchmark set for serious regression testing.

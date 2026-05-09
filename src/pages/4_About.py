@@ -63,7 +63,7 @@ st.markdown(
       retrieved snippet.
     - Logs out-of-scope queries as library gaps, turning product usage into a practical roadmap
       for future ingestion.
-    - Supports local inference with MLX on Apple Silicon, while keeping optional RAGAS evals
+    - Supports local inference with MLX on Apple Silicon, while keeping optional DeepEval evals
       available through OpenAI-backed evaluation models.
     """
 )
@@ -99,11 +99,12 @@ st.markdown("### Architecture at a glance")
 
 architecture = [
     ("Offline ingestion", "PDF parsing, chunking, contextual summaries, embeddings, Chroma persistence, and BM25 indexing."),
-    ("Input guardrail", "Lightweight checks for sensitive data patterns and prompt-injection style requests."),
-    ("Router", "Classifies each query into supported domains or directs greetings and out-of-scope requests to fast paths."),
+    ("Guardrails", "Lightweight input and output checks for sensitive data, prompt-injection patterns, and ungrounded responses."),
+    ("Router", "Classifies each query and generates retrieval expansions in one structured call."),
+    ("Semantic cache", "Reuses prior grounded answers when a new query is semantically similar enough."),
     ("Retriever", "Combines semantic and lexical search, deduplicates evidence, fuses rankings, and reranks candidates."),
     ("Synthesizer", "Generates an answer using only retrieved context and returns source-backed mentorship."),
-    ("Observability", "Tracks RAGAS scores, library gaps, and per-session micro-royalty transactions."),
+    ("Observability", "Tracks DeepEval scores, latency spans, library gaps, and per-session micro-royalty transactions."),
 ]
 
 for name, description in architecture:
