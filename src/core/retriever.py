@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import yaml
 import pickle
 from pathlib import Path
@@ -60,6 +61,7 @@ class HybridRetriever:
         # 3. Local cross-encoder is loaded lazily and only in local mode.
         self._cross_encoder = None
         self._openai_reranker = None
+        self.last_timings = {}
 
     @property
     def cross_encoder(self):
@@ -114,6 +116,11 @@ class HybridRetriever:
 
     def retrieve(self, queries: List[str]) -> List[Dict[str, Any]]:
         """Executes Hybrid Search across multiple expanded queries."""
+        started_total = time.perf_counter()
+        semantic_ms = 0.0
+        lexical_ms = 0.0
+        fusion_ms = 0.0
+        reranker_ms = 0.0
         all_vector_results = []
         all_bm25_results = []
         
@@ -122,10 +129,12 @@ class HybridRetriever:
 
         for query in queries:
             # --- A. Semantic Search (Chroma) ---
+            started = time.perf_counter()
             vector_res = self.collection.query(
                 query_texts=[query],
                 n_results=self.retrieval_cfg["semantic_top_k"]
             )
+            semantic_ms += (time.perf_counter() - started) * 1000
             
             for idx, chunk_id in enumerate(vector_res["ids"][0]):
                 if chunk_id not in seen_vector_ids:
@@ -138,6 +147,7 @@ class HybridRetriever:
                     seen_vector_ids.add(chunk_id)
 
             # --- B. Lexical Search (BM25) ---
+            started = time.perf_counter()
             tokenized_query = query.split()
             bm25_scores = self.bm25_model.get_scores(tokenized_query)
             top_n_indices = bm25_scores.argsort()[::-1][:self.retrieval_cfg["lexical_top_k"]]
@@ -170,21 +180,56 @@ class HybridRetriever:
                             "author": meta["author"]
                         })
                         seen_bm25_ids.add(chunk_id)
+            lexical_ms += (time.perf_counter() - started) * 1000
 
         # --- C. Reciprocal Rank Fusion ---
+        started = time.perf_counter()
         fused_results = self._reciprocal_rank_fusion(all_vector_results, all_bm25_results)
+        fusion_ms = (time.perf_counter() - started) * 1000
         
         if not fused_results:
+            self.last_timings = {
+                "semantic_search": round(semantic_ms, 2),
+                "lexical_search": round(lexical_ms, 2),
+                "fusion": round(fusion_ms, 2),
+                "reranker": 0.0,
+                "retriever_total": round((time.perf_counter() - started_total) * 1000, 2),
+            }
             return []
 
         # --- D. Reranking ---
         # Compare every fused chunk against the primary (first) original query
         primary_query = queries[0] 
-        if self.inference_mode == "openai":
-            return self._rerank_with_openai(primary_query, fused_results)
+        use_openai_reranker = bool(self.config["openai"].get("use_llm_reranker", False))
+        if self.inference_mode == "openai" and use_openai_reranker:
+            started = time.perf_counter()
+            results = self._rerank_with_openai(primary_query, fused_results)
+            reranker_ms = (time.perf_counter() - started) * 1000
+            self.last_timings = {
+                "semantic_search": round(semantic_ms, 2),
+                "lexical_search": round(lexical_ms, 2),
+                "fusion": round(fusion_ms, 2),
+                "reranker": round(reranker_ms, 2),
+                "retriever_total": round((time.perf_counter() - started_total) * 1000, 2),
+            }
+            return results
 
+        if self.inference_mode == "openai":
+            for item in fused_results:
+                item["cross_score"] = 0.0
+            self.last_timings = {
+                "semantic_search": round(semantic_ms, 2),
+                "lexical_search": round(lexical_ms, 2),
+                "fusion": round(fusion_ms, 2),
+                "reranker": 0.0,
+                "retriever_total": round((time.perf_counter() - started_total) * 1000, 2),
+            }
+            return fused_results[:self.retrieval_cfg["final_top_n"]]
+
+        started = time.perf_counter()
         cross_inp = [[primary_query, item["text"]] for item in fused_results]
         cross_scores = self.cross_encoder.predict(cross_inp, show_progress_bar=False)
+        reranker_ms = (time.perf_counter() - started) * 1000
         
         # Attach scores and sort highest to lowest
         for i, score in enumerate(cross_scores):
@@ -193,6 +238,13 @@ class HybridRetriever:
         reranked_results = sorted(fused_results, key=lambda x: x["cross_score"], reverse=True)
         
         # Return exact Top N defined in config
+        self.last_timings = {
+            "semantic_search": round(semantic_ms, 2),
+            "lexical_search": round(lexical_ms, 2),
+            "fusion": round(fusion_ms, 2),
+            "reranker": round(reranker_ms, 2),
+            "retriever_total": round((time.perf_counter() - started_total) * 1000, 2),
+        }
         return reranked_results[:self.retrieval_cfg["final_top_n"]]
 
     def _rerank_with_openai(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

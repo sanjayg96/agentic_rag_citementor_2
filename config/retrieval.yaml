@@ -15,16 +15,16 @@ openai:
   # GPT-5 nano handles simple routing, expansion, and candidate reranking.
   # GPT-5 mini handles final synthesis where answer quality matters more.
   router_model: "gpt-5-nano"
-  query_expansion_model: "gpt-5-nano"
   reranker_model: "gpt-5-nano"
+  use_llm_reranker: false
   synthesis_model: "gpt-5-mini"
   ingestion_context_model: "gpt-5-nano"
   ingestion_summary_batch_size: 20
   embedding_model: "text-embedding-3-small"
   eval_model: "gpt-5-mini"
-  eval_embedding_model: "text-embedding-3-small"
 
 retrieval:
+  max_expanded_queries: 2
   semantic_top_k: 10
   lexical_top_k: 10
   bm25_weight: 0.3

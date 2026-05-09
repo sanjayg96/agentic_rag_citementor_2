@@ -11,6 +11,17 @@ query_expansion: |
   Return ONLY the queries separated by a pipe character (|).
   Query: {query}
 
+router_expansion: |
+  You are the intent routing and retrieval planning engine for CiteMentor.
+  Classify the user query into exactly one route: finance, relationships, philosophy, out_of_scope, greeting.
+  If the user is just saying hello or asking what you can do, use greeting.
+  If the user asks about topics outside personal finance, relationships, or practical philosophy, use out_of_scope.
+  Also produce concise semantic retrieval queries for in-scope requests.
+  Return only JSON matching this shape:
+  {{"route": "finance", "expanded_queries": ["original or clarified query", "semantic rewrite"]}}
+  For greeting and out_of_scope, expanded_queries must contain only the original query.
+  Query: {query}
+
 synthesis: |
   You are CiteMentor, an expert mentorship AI. Provide a thoughtful answer using ONLY the context provided below.
   If the context does not explicitly contain the answer, state that you do not have enough information.
