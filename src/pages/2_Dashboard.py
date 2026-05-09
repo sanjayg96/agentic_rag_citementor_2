@@ -3,16 +3,16 @@ import pandas as pd
 
 st.set_page_config(page_title="System Observability", layout="wide")
 
-st.title("📊 System Observability & RAGAS Metrics")
+st.title("📊 System Observability & Evaluation Metrics")
 st.caption("Monitor retrieval performance and identify library gaps for future ingestion.")
 
-# --- Dynamic RAGAS Metrics ---
+# --- Dynamic Evaluation Metrics ---
 st.markdown("### 🎯 Live Session Retrieval Performance")
 
-eval_data = st.session_state.get("ragas_evals", [])
+eval_data = st.session_state.get("evals", [])
 
 if not eval_data:
-    st.info("No evaluations run yet. Enable 'Live RAGAS Eval' in the Mentor chat to generate data.")
+    st.info("No evaluations run yet. Enable 'Live DeepEval' in the Mentor chat to generate data.")
     f_score, r_score = 0.0, 0.0
 else:
     # Calculate rolling averages
@@ -41,6 +41,45 @@ m3.metric(
 if eval_data:
     with st.expander("View Query-Level Evaluation Logs"):
         st.dataframe(df_evals, use_container_width=True)
+
+st.markdown("---")
+
+# --- Latency Spans ---
+st.markdown("### ⏱️ Pipeline Latency")
+st.caption("Per-query spans captured from the Mentor graph path.")
+
+latency_data = st.session_state.get("latency_spans", [])
+if not latency_data:
+    st.info("No latency spans captured yet. Ask a question in the Mentor chat to populate this view.")
+else:
+    df_latency = pd.DataFrame(latency_data)
+    span_columns = [
+        "input_guard",
+        "semantic_cache",
+        "router",
+        "semantic_search",
+        "lexical_search",
+        "fusion",
+        "reranker",
+        "retriever",
+        "synthesis",
+        "output_guard",
+        "semantic_cache_store",
+    ]
+    existing_span_columns = [col for col in span_columns if col in df_latency.columns]
+    totals = df_latency[existing_span_columns].fillna(0).sum(axis=1)
+    avg_total = totals.mean()
+    cache_hits = int(df_latency.get("cache_hit", pd.Series(dtype=bool)).fillna(False).sum())
+    avg_synthesis = df_latency["synthesis"].mean() if "synthesis" in df_latency.columns else 0.0
+
+    l1, l2, l3 = st.columns(3)
+    l1.metric("Avg Pipeline Latency", f"{avg_total:.0f} ms")
+    l2.metric("Semantic Cache Hits", cache_hits)
+    l3.metric("Avg Synthesis", f"{avg_synthesis:.0f} ms")
+
+    with st.expander("View Timing Spans"):
+        display_columns = ["query", "cache_hit", *existing_span_columns]
+        st.dataframe(df_latency[[col for col in display_columns if col in df_latency.columns]], use_container_width=True)
 
 st.markdown("---")
 

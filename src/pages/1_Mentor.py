@@ -1,5 +1,8 @@
 import json
 import math
+import os
+import sys
+import time
 import yaml
 import streamlit as st
 
@@ -9,10 +12,14 @@ from src.core.graph import (
     retriever_node,
     stream_synthesis_answer,
 )
+from src.core.guardrails import check_output_safety
 from src.core.ledger import record_transaction
+from src.core.semantic_cache import SemanticAnswerCache
 
 with open("config/retrieval.yaml", "r") as f:
     config = yaml.safe_load(f)
+
+os.environ.setdefault("DEEPEVAL_TELEMETRY_OPT_OUT", "YES")
 
 st.title("💬 CiteMentor 2.0")
 st.caption("Agentic Mentorship powered by Local MLX & Hybrid RAG")
@@ -27,98 +34,55 @@ except Exception:
 def _safe_float(value):
     score = float(value)
     if math.isnan(score):
-        raise ValueError("RAGAS returned NaN for at least one metric.")
+        raise ValueError("Evaluator returned NaN for at least one metric.")
     return score
 
-def _extract_json_object(text: str) -> dict:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1:
-            raise
-        return json.loads(text[start:end + 1])
+@st.cache_resource(show_spinner=False)
+def get_answer_cache():
+    return SemanticAnswerCache()
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 2)
+
+def _merge_timings(state: dict, updates: dict[str, float]) -> dict[str, float]:
+    state["timings"] = {**state.get("timings", {}), **updates}
+    return state["timings"]
 
 def run_live_eval(prompt: str, answer: str, retrieved_chunks: list[dict]) -> tuple[dict | None, str | None]:
     try:
-        from datasets import Dataset
-        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-        from ragas import evaluate
-        from ragas.embeddings import LangchainEmbeddingsWrapper
-        from ragas.llms import LangchainLLMWrapper
-        from ragas.metrics import Faithfulness, AnswerRelevancy
-
-        contexts = [c["text"] for c in retrieved_chunks]
-        dataset = Dataset.from_dict({
-            "user_input": [prompt],
-            "response": [answer],
-            "retrieved_contexts": [contexts]
-        })
-
-        base_llm = ChatOpenAI(model=config["openai"]["eval_model"], temperature=0)
-        base_embeddings = OpenAIEmbeddings(model=config["openai"]["eval_embedding_model"])
-        ragas_llm = LangchainLLMWrapper(base_llm)
-        ragas_embeddings = LangchainEmbeddingsWrapper(base_embeddings)
-
-        score = evaluate(
-            dataset,
-            metrics=[
-                Faithfulness(llm=ragas_llm),
-                AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
-            ],
-            raise_exceptions=True,
-            show_progress=False,
+        from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric
+        from deepeval.test_case import LLMTestCase
+    except ModuleNotFoundError as import_error:
+        return None, (
+            f"DeepEval is not installed in the Python environment running Streamlit: {sys.executable}. "
+            "Run the app from this project with `uv run streamlit run src/app.py` after `uv sync`."
         )
 
-        score_dict = score.to_pandas().iloc[0].to_dict()
+    try:
+        contexts = [c["text"] for c in retrieved_chunks]
+        test_case = LLMTestCase(
+            input=prompt,
+            actual_output=answer,
+            retrieval_context=contexts,
+        )
+
+        eval_model = config["openai"]["eval_model"]
+        faithfulness = FaithfulnessMetric(model=eval_model, include_reason=True, async_mode=False)
+        answer_relevancy = AnswerRelevancyMetric(model=eval_model, include_reason=True, async_mode=False)
+        faithfulness.measure(test_case)
+        answer_relevancy.measure(test_case)
+
         eval_data = {
             "query": prompt,
-            "faithfulness": _safe_float(score_dict.get("faithfulness")),
-            "answer_relevancy": _safe_float(score_dict.get("answer_relevancy")),
-            "method": "ragas",
+            "faithfulness": _safe_float(faithfulness.score),
+            "answer_relevancy": _safe_float(answer_relevancy.score),
+            "method": "deepeval",
+            "faithfulness_reason": faithfulness.reason,
+            "answer_relevancy_reason": answer_relevancy.reason,
         }
         return eval_data, None
-    except Exception as ragas_error:
-        fallback_data = run_fallback_eval(prompt, answer, retrieved_chunks)
-        if fallback_data:
-            return fallback_data, f"RAGAS unavailable: {type(ragas_error).__name__}: {ragas_error}. Used fallback judge."
-        return None, f"{type(ragas_error).__name__}: {ragas_error}"
-
-def run_fallback_eval(prompt: str, answer: str, retrieved_chunks: list[dict]) -> dict | None:
-    try:
-        from langchain_openai import ChatOpenAI
-
-        contexts = "\n\n".join(f"[Context {idx + 1}] {chunk['text']}" for idx, chunk in enumerate(retrieved_chunks))
-        judge_prompt = f"""
-You are evaluating a retrieval-augmented answer.
-Return only valid JSON with this shape:
-{{"faithfulness": 0.0, "answer_relevancy": 0.0, "reason": "..."}}
-
-Scoring:
-- faithfulness: 1.0 means every important claim is supported by the contexts; 0.0 means unsupported or contradicted.
-- answer_relevancy: 1.0 means the answer directly addresses the user query; 0.0 means it is off-topic.
-
-User query:
-{prompt}
-
-Answer:
-{answer}
-
-Retrieved contexts:
-{contexts}
-"""
-        llm = ChatOpenAI(model=config["openai"]["eval_model"], temperature=0)
-        parsed = _extract_json_object(llm.invoke(judge_prompt).content)
-        return {
-            "query": prompt,
-            "faithfulness": max(0.0, min(1.0, float(parsed["faithfulness"]))),
-            "answer_relevancy": max(0.0, min(1.0, float(parsed["answer_relevancy"]))),
-            "method": "fallback_judge",
-            "reason": parsed.get("reason", ""),
-        }
-    except Exception:
-        return None
+    except Exception as eval_error:
+        return None, f"DeepEval failed: {type(eval_error).__name__}: {eval_error}"
 
 # Initialize Session States
 if "messages" not in st.session_state:
@@ -129,18 +93,20 @@ if "ledger_details" not in st.session_state:
     st.session_state["ledger_details"] = []
 if "gaps_log" not in st.session_state:
     st.session_state["gaps_log"] = []
-if "ragas_evals" not in st.session_state:
-    st.session_state["ragas_evals"] = [] 
+if "evals" not in st.session_state:
+    st.session_state["evals"] = []
+if "latency_spans" not in st.session_state:
+    st.session_state["latency_spans"] = []
 
 # Sidebar Controls & Ledger
 st.sidebar.markdown("### ⚙️ Controls")
 openai_mode = config["system"].get("inference_mode") == "openai"
 run_eval = st.sidebar.toggle(
-    "🔬 Enable Live RAGAS Eval",
+    "🔬 Enable Live DeepEval",
     value=False,
     disabled=not openai_mode,
     help=(
-        "Uses OpenAI to grade the response. Adds 5-10s latency."
+        "Uses DeepEval with OpenAI to grade the response. Adds evaluation latency."
         if openai_mode
         else "Live API evals are disabled in local mode so the full app stays local."
     )
@@ -158,6 +124,8 @@ st.sidebar.metric("Accumulated Knowledge Cost", f"${st.session_state.get('royalt
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message.get("cache_hit"):
+            st.caption(f"Semantic cache hit ({message.get('cache_similarity', 0.0):.2f} similarity)")
         
         # Render Sources
         if "sources" in message and message["sources"]:
@@ -170,7 +138,7 @@ for message in st.session_state.messages:
                     
         # Render Eval Results
         if "eval" in message and message["eval"]:
-            method = message["eval"].get("method", "ragas")
+            method = message["eval"].get("method", "deepeval")
             st.info(
                 f"🔬 **Eval Complete ({method})** — "
                 f"Faithfulness: {message['eval']['faithfulness']:.2f} | "
@@ -186,33 +154,99 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        state = {"query": prompt}
+        state = {"query": prompt, "timings": {}}
         eval_data_to_save = None
         eval_error_to_save = None
         processed_sources = []
+        cache_hit = False
+        cache_similarity = 0.0
 
         with st.status("Running CiteMentor pipeline...", expanded=True) as status:
             st.write("Input guardrail: checking safety boundaries")
+            started = time.perf_counter()
             guard_update = input_guard_node(state)
             state.update(guard_update)
+            state["timings"]["input_guard"] = guard_update.get("timings", {}).get("input_guard", _elapsed_ms(started))
 
             if state.get("is_safe") is False:
                 answer = f"Request blocked: {state['guardrail_reason']}"
                 status.update(label="Blocked by input guardrail", state="error")
                 st.error(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.session_state.latency_spans.append({"query": prompt, **state.get("timings", {})})
+                st.session_state.messages.append({"role": "assistant", "content": answer, "timings": state.get("timings", {})})
+                st.stop()
+
+            st.write("Semantic cache: checking previous grounded answers")
+            started = time.perf_counter()
+            cache_result = None
+            try:
+                cache_result = get_answer_cache().lookup(prompt)
+            except Exception as cache_error:
+                st.caption(f"Semantic cache skipped: {type(cache_error).__name__}")
+            _merge_timings(state, {"semantic_cache": _elapsed_ms(started)})
+
+            if cache_result:
+                cache_hit = True
+                cache_similarity = cache_result["similarity"]
+                answer = cache_result["answer"]
+                retrieved_chunks = cache_result["sources"]
+                status.update(label=f"Served from semantic cache ({cache_similarity:.2f})", state="complete")
+                st.caption(f"Semantic cache hit from: {cache_result.get('matched_query', prompt)}")
+                st.markdown(answer)
+
+                if retrieved_chunks:
+                    st.markdown("---")
+                    st.markdown("### 📚 Source Citations & Ledger")
+                    for chunk in retrieved_chunks:
+                        cost = record_transaction(st.session_state, chunk["book_id"])
+                        chunk["cost"] = cost
+                        processed_sources.append(chunk)
+                        title = catalog_data.get(chunk["book_id"], {}).get("title", chunk["book_id"])
+                        with st.expander(f"📖 {title} | Author: {chunk['author']}"):
+                            st.markdown(f"**Snippet Cost:** `${cost:.6f}`")
+                            st.write(chunk["text"])
+
+                if run_eval and retrieved_chunks:
+                    with st.status("Running DeepEval evaluation...", expanded=True) as eval_status:
+                        eval_data_to_save, eval_error_to_save = run_live_eval(prompt, answer, retrieved_chunks)
+                        if eval_data_to_save:
+                            st.session_state.evals.append(eval_data_to_save)
+                            eval_status.update(label="DeepEval evaluation complete", state="complete")
+                            st.info(
+                                f"🔬 **Eval Complete (deepeval)** — "
+                                f"Faithfulness: {eval_data_to_save['faithfulness']:.2f} | "
+                                f"Relevance: {eval_data_to_save['answer_relevancy']:.2f}"
+                            )
+                        else:
+                            eval_status.update(label="DeepEval evaluation failed", state="error")
+                            st.warning(f"⚠️ **Eval Failed:** {eval_error_to_save}")
+
+                st.session_state.latency_spans.append({"query": prompt, "cache_hit": True, **state.get("timings", {})})
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": processed_sources,
+                    "eval": eval_data_to_save,
+                    "eval_error": eval_error_to_save,
+                    "timings": state.get("timings", {}),
+                    "cache_hit": cache_hit,
+                    "cache_similarity": cache_similarity,
+                })
                 st.stop()
 
             st.write("Router: classifying intent and expanding the query")
+            started = time.perf_counter()
             route_update = router_node(state)
             state.update(route_update)
+            state["timings"]["router"] = route_update.get("timings", {}).get("router", _elapsed_ms(started))
             st.write(f"Route selected: `{state['route']}`")
 
             if state.get("route") == "greeting":
                 answer = "Hi! I am CiteMentor. I can offer advice based on my curated library of non-fiction books covering finance, philosophy, and relationships. How can I help you today?"
                 status.update(label="Greeting handled", state="complete")
                 st.write(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.session_state.latency_spans.append({"query": prompt, **state.get("timings", {})})
+                st.session_state.messages.append({"role": "assistant", "content": answer, "timings": state.get("timings", {})})
                 st.stop()
 
             if state.get("route") == "out_of_scope":
@@ -220,13 +254,17 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
                 status.update(label="Out-of-scope route handled", state="complete")
                 st.info("Badge: Public Domain Knowledge (Zero Charge)")
                 st.write(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.session_state.latency_spans.append({"query": prompt, **state.get("timings", {})})
+                st.session_state.messages.append({"role": "assistant", "content": answer, "timings": state.get("timings", {})})
                 st.session_state.gaps_log.append({"query": prompt})
                 st.stop()
 
             st.write("Retriever: running semantic search, BM25, fusion, and reranking")
+            started = time.perf_counter()
             retrieval_update = retriever_node(state)
             state.update(retrieval_update)
+            state["timings"].update(retrieval_update.get("timings", {}))
+            state["timings"]["retriever"] = retrieval_update.get("timings", {}).get("retriever", _elapsed_ms(started))
             retrieved_chunks = state.get("retrieved_chunks", [])
             st.write(f"Retriever returned `{len(retrieved_chunks)}` final source chunks")
 
@@ -234,9 +272,18 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
 
         answer_placeholder = st.empty()
         streamed_answer = ""
+        started = time.perf_counter()
         for token in stream_synthesis_answer(state):
             streamed_answer += token
             answer_placeholder.markdown(streamed_answer + "▌")
+        _merge_timings(state, {"synthesis": _elapsed_ms(started)})
+
+        started = time.perf_counter()
+        output_check = check_output_safety(streamed_answer, state.get("retrieved_chunks", []))
+        _merge_timings(state, {"output_guard": _elapsed_ms(started)})
+        if not output_check["is_safe"]:
+            streamed_answer = f"I cannot safely return that answer: {output_check['reason']}"
+            st.warning("Output guardrail revised the response before saving it.")
 
         answer_placeholder.markdown(streamed_answer)
         status.update(label="Pipeline complete", state="complete")
@@ -258,33 +305,43 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
                     st.markdown(f"**Snippet Cost:** `${cost:.6f}`")
                     st.write(chunk["text"])
 
-        # --- LIVE RAGAS EVALUATION ---
+        if retrieved_chunks and output_check["is_safe"]:
+            started = time.perf_counter()
+            try:
+                get_answer_cache().store(prompt, result["answer"], retrieved_chunks)
+            except Exception as cache_error:
+                st.caption(f"Semantic cache store skipped: {type(cache_error).__name__}")
+            _merge_timings(state, {"semantic_cache_store": _elapsed_ms(started)})
+
+        # --- LIVE EVALUATION ---
         if run_eval and retrieved_chunks:
-            with st.status("Running RAGAS evaluation...", expanded=True) as eval_status:
+            with st.status("Running DeepEval evaluation...", expanded=True) as eval_status:
                 st.write("Evaluating faithfulness against retrieved contexts")
                 st.write("Evaluating answer relevancy against the user query")
                 eval_data_to_save, eval_error_to_save = run_live_eval(prompt, result["answer"], retrieved_chunks)
                 if eval_data_to_save:
-                    st.session_state.ragas_evals.append(eval_data_to_save)
-                    eval_status.update(label="Evaluation complete", state="complete")
+                    st.session_state.evals.append(eval_data_to_save)
+                    eval_status.update(label="DeepEval evaluation complete", state="complete")
                     st.info(
-                        f"🔬 **Eval Complete ({eval_data_to_save.get('method', 'ragas')})** — "
+                        f"🔬 **Eval Complete (deepeval)** — "
                         f"Faithfulness: {eval_data_to_save['faithfulness']:.2f} | "
                         f"Relevance: {eval_data_to_save['answer_relevancy']:.2f}"
                     )
-                    if eval_error_to_save:
-                        st.warning(eval_error_to_save)
                 else:
-                    eval_status.update(label="Evaluation failed", state="error")
+                    eval_status.update(label="DeepEval evaluation failed", state="error")
                     st.warning(f"⚠️ **Eval Failed:** {eval_error_to_save}")
 
         # Save state
+        st.session_state.latency_spans.append({"query": prompt, "cache_hit": cache_hit, **state.get("timings", {})})
         st.session_state.messages.append({
             "role": "assistant", 
             "content": result["answer"],
             "sources": processed_sources,
             "eval": eval_data_to_save,
-            "eval_error": eval_error_to_save
+            "eval_error": eval_error_to_save,
+            "timings": state.get("timings", {}),
+            "cache_hit": cache_hit,
+            "cache_similarity": cache_similarity,
         })
         
         st.rerun()
