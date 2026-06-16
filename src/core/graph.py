@@ -3,6 +3,7 @@ import time
 from functools import lru_cache
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
+from langgraph.config import get_stream_writer
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from src.core.guardrails import check_input_safety, check_output_safety
@@ -26,6 +27,13 @@ def get_retriever():
     from src.core.retriever import HybridRetriever
 
     return HybridRetriever()
+
+@lru_cache(maxsize=1)
+def get_answer_cache():
+    """Keeps the semantic answer cache resident after the first lookup."""
+    from src.core.semantic_cache import SemanticAnswerCache
+
+    return SemanticAnswerCache()
 
 @lru_cache(maxsize=1)
 def get_local_llm():
@@ -95,7 +103,7 @@ def build_synthesis_prompt(state: "AgentState") -> str | None:
     context = "\n\n".join(context_parts)
     return prompts["synthesis"].format(context=context, query=state["query"])
 
-def stream_synthesis_answer(state: "AgentState"):
+def _stream_synthesis_tokens(state: "AgentState"):
     """Yields answer text incrementally where the active model supports streaming."""
     formatted_prompt = build_synthesis_prompt(state)
     if formatted_prompt is None:
@@ -129,6 +137,9 @@ class AgentState(TypedDict):
     guardrail_reason: str
     output_is_safe: bool
     output_guardrail_reason: str
+    cache_hit: bool
+    cache_similarity: float
+    matched_query: str
     timings: Dict[str, float]
 
 # 2. Node Functions
@@ -140,6 +151,25 @@ def input_guard_node(state: AgentState):
         "is_safe": safety_check["is_safe"], 
         "guardrail_reason": safety_check["reason"]
     })
+
+def cache_lookup_node(state: AgentState):
+    """Checks the semantic answer cache before spending router/retrieval compute."""
+    started_at = time.perf_counter()
+    try:
+        cache_result = get_answer_cache().lookup(state["query"])
+    except Exception:
+        cache_result = None
+
+    if cache_result:
+        return _timed_update(state, "semantic_cache", started_at, {
+            "cache_hit": True,
+            "cache_similarity": cache_result["similarity"],
+            "matched_query": cache_result.get("matched_query", state["query"]),
+            "answer": cache_result["answer"],
+            "retrieved_chunks": cache_result["sources"],
+        })
+
+    return _timed_update(state, "semantic_cache", started_at, {"cache_hit": False})
 
 def router_node(state: AgentState):
     """Classifies the domain and generates semantic expansions in one model call."""
@@ -182,31 +212,29 @@ def retriever_node(state: AgentState):
     """Executes the Hybrid Search & RRF."""
     started_at = time.perf_counter()
     retriever_engine = get_retriever()
-    chunks = retriever_engine.retrieve(state["expanded_queries"])
+    chunks = retriever_engine.retrieve(state["expanded_queries"], route=state.get("route"))
     elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
     timings = _merge_timings(state, {"retriever": elapsed_ms})
     timings.update(getattr(retriever_engine, "last_timings", {}))
     return {"retrieved_chunks": chunks, "timings": timings}
 
 def synthesis_node(state: AgentState):
-    """Drafts the final response using only the retrieved context."""
+    """Drafts the final response using only the retrieved context.
+
+    Streams tokens through the LangGraph custom stream writer so callers using
+    ``stream_mode="custom"`` (the Streamlit UI) get live output, while plain
+    ``.invoke()`` callers still receive the full answer in the returned state.
+    """
     started_at = time.perf_counter()
-    formatted_prompt = build_synthesis_prompt(state)
-    if formatted_prompt is None:
-        return _timed_update(
-            state,
-            "synthesis",
-            started_at,
-            {"answer": "I don't have enough information in my library to answer this."},
-        )
-    
-    if config["system"]["inference_mode"] == "openai":
-        llm = get_openai_llm(config["openai"]["synthesis_model"])
-        answer = llm.invoke(formatted_prompt).content
-    else:
-        # Local MLX Execution
-        answer = local_generate(formatted_prompt, max_tokens=1024)
-        
+    writer = get_stream_writer()
+
+    answer_parts = []
+    for token in _stream_synthesis_tokens(state):
+        answer_parts.append(token)
+        if writer:
+            writer(token)
+    answer = "".join(answer_parts)
+
     return _timed_update(state, "synthesis", started_at, {"answer": answer})
 
 def output_guard_node(state: AgentState):
@@ -221,6 +249,17 @@ def output_guard_node(state: AgentState):
         "output_is_safe": safety_check["is_safe"],
         "output_guardrail_reason": safety_check["reason"],
     })
+
+def cache_store_node(state: AgentState):
+    """Persists freshly grounded answers so similar future queries hit the cache."""
+    started_at = time.perf_counter()
+    retrieved_chunks = state.get("retrieved_chunks", [])
+    if state.get("output_is_safe", True) and retrieved_chunks and not state.get("cache_hit", False):
+        try:
+            get_answer_cache().store(state["query"], state["answer"], retrieved_chunks)
+        except Exception:
+            pass
+    return _timed_update(state, "semantic_cache_store", started_at, {})
 
 def greeting_node(state: AgentState):
     """Fast response for conversational greetings."""
@@ -240,6 +279,10 @@ def unsafe_node(state: AgentState):
 # 3. Conditional Routing Logic
 def route_after_guard(state: AgentState):
     if not state.get("is_safe", True): return "unsafe"
+    return "cache_lookup"
+
+def route_after_cache(state: AgentState):
+    if state.get("cache_hit", False): return "cache_hit"
     return "router"
 
 def route_after_router(state: AgentState):
@@ -251,11 +294,13 @@ def route_after_router(state: AgentState):
 workflow = StateGraph(AgentState)
 
 workflow.add_node("input_guard", input_guard_node)
+workflow.add_node("cache_lookup", cache_lookup_node)
 workflow.add_node("router", router_node)
 workflow.add_node("greeting", greeting_node)
 workflow.add_node("retriever", retriever_node)
 workflow.add_node("synthesis", synthesis_node)
 workflow.add_node("output_guard", output_guard_node)
+workflow.add_node("cache_store", cache_store_node)
 workflow.add_node("out_of_scope", out_of_scope_node)
 workflow.add_node("unsafe", unsafe_node)
 
@@ -263,6 +308,11 @@ workflow.set_entry_point("input_guard")
 
 workflow.add_conditional_edges("input_guard", route_after_guard, {
     "unsafe": "unsafe",
+    "cache_lookup": "cache_lookup"
+})
+
+workflow.add_conditional_edges("cache_lookup", route_after_cache, {
+    "cache_hit": END,
     "router": "router"
 })
 
@@ -274,7 +324,8 @@ workflow.add_conditional_edges("router", route_after_router, {
 
 workflow.add_edge("retriever", "synthesis")
 workflow.add_edge("synthesis", "output_guard")
-workflow.add_edge("output_guard", END)
+workflow.add_edge("output_guard", "cache_store")
+workflow.add_edge("cache_store", END)
 workflow.add_edge("out_of_scope", END)
 workflow.add_edge("unsafe", END)
 workflow.add_edge("greeting", END)

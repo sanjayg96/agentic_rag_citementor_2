@@ -47,8 +47,11 @@ OpenAI inference mode.
 
 ## Core Features
 
-- **Agentic RAG workflow:** LangGraph coordinates guardrails, combined routing
-  plus query expansion, retrieval, optional reranking, and grounded synthesis.
+- **Agentic RAG workflow:** A single compiled LangGraph (`src/core/graph.py`)
+  coordinates input guardrails, a semantic-cache short-circuit, combined routing
+  plus query expansion, retrieval, optional reranking, grounded synthesis, output
+  guardrails, and cache writes. The Streamlit app and the `main.py` CLI both drive
+  this same compiled graph (`app_graph`).
 - **Hybrid retrieval:** Combines vector search, BM25 lexical search, reciprocal
   rank fusion, and reranking.
 - **Source cards:** Every standard answer displays the retrieved book snippets

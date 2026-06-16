@@ -300,6 +300,7 @@ def process_and_ingest(profile: str = "local", reset: bool = False, source: str 
                 "book_id": book_id,
                 "title": metadata["title"],
                 "author": metadata["author"],
+                "genre": metadata.get("genre", "unknown"),
                 "chunk_index": i,
             }
             chunk_metadatas.append(meta)

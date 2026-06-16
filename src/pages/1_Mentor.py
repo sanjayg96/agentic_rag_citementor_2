@@ -2,19 +2,11 @@ import json
 import math
 import os
 import sys
-import time
 import yaml
 import streamlit as st
 
-from src.core.graph import (
-    input_guard_node,
-    router_node,
-    retriever_node,
-    stream_synthesis_answer,
-)
-from src.core.guardrails import check_output_safety
+from src.core.graph import app_graph
 from src.core.ledger import record_transaction
-from src.core.semantic_cache import SemanticAnswerCache
 
 with open("config/retrieval.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -36,17 +28,6 @@ def _safe_float(value):
     if math.isnan(score):
         raise ValueError("Evaluator returned NaN for at least one metric.")
     return score
-
-@st.cache_resource(show_spinner=False)
-def get_answer_cache():
-    return SemanticAnswerCache()
-
-def _elapsed_ms(started_at: float) -> float:
-    return round((time.perf_counter() - started_at) * 1000, 2)
-
-def _merge_timings(state: dict, updates: dict[str, float]) -> dict[str, float]:
-    state["timings"] = {**state.get("timings", {}), **updates}
-    return state["timings"]
 
 def run_live_eval(prompt: str, answer: str, retrieved_chunks: list[dict]) -> tuple[dict | None, str | None]:
     try:
@@ -153,172 +134,103 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # Status panel messages keyed by graph node name. The cache node is named
+    # "cache_lookup" in the graph but records its span under "semantic_cache".
+    NODE_STATUS_MESSAGES = {
+        "input_guard": "Input guardrail: checking safety boundaries",
+        "cache_lookup": "Semantic cache: checking previous grounded answers",
+        "router": "Router: classifying intent and expanding the query",
+        "retriever": "Retriever: running semantic search, BM25, fusion, and reranking",
+        "output_guard": "Output guardrail: validating the grounded answer",
+    }
+
     with st.chat_message("assistant"):
-        state = {"query": prompt, "timings": {}}
         eval_data_to_save = None
         eval_error_to_save = None
         processed_sources = []
-        cache_hit = False
-        cache_similarity = 0.0
 
-        with st.status("Running CiteMentor pipeline...", expanded=True) as status:
-            st.write("Input guardrail: checking safety boundaries")
-            started = time.perf_counter()
-            guard_update = input_guard_node(state)
-            state.update(guard_update)
-            state["timings"]["input_guard"] = guard_update.get("timings", {}).get("input_guard", _elapsed_ms(started))
-
-            if state.get("is_safe") is False:
-                answer = f"Request blocked: {state['guardrail_reason']}"
-                status.update(label="Blocked by input guardrail", state="error")
-                st.error(answer)
-                st.session_state.latency_spans.append({"query": prompt, **state.get("timings", {})})
-                st.session_state.messages.append({"role": "assistant", "content": answer, "timings": state.get("timings", {})})
-                st.stop()
-
-            st.write("Semantic cache: checking previous grounded answers")
-            started = time.perf_counter()
-            cache_result = None
-            try:
-                cache_result = get_answer_cache().lookup(prompt)
-            except Exception as cache_error:
-                st.caption(f"Semantic cache skipped: {type(cache_error).__name__}")
-            _merge_timings(state, {"semantic_cache": _elapsed_ms(started)})
-
-            if cache_result:
-                cache_hit = True
-                cache_similarity = cache_result["similarity"]
-                answer = cache_result["answer"]
-                retrieved_chunks = cache_result["sources"]
-                status.update(label=f"Served from semantic cache ({cache_similarity:.2f})", state="complete")
-                st.caption(f"Semantic cache hit from: {cache_result.get('matched_query', prompt)}")
-                st.markdown(answer)
-
-                if retrieved_chunks:
-                    st.markdown("---")
-                    st.markdown("### 📚 Source Citations & Ledger")
-                    for chunk in retrieved_chunks:
-                        cost = record_transaction(st.session_state, chunk["book_id"])
-                        chunk["cost"] = cost
-                        processed_sources.append(chunk)
-                        title = catalog_data.get(chunk["book_id"], {}).get("title", chunk["book_id"])
-                        with st.expander(f"📖 {title} | Author: {chunk['author']}"):
-                            st.markdown(f"**Snippet Cost:** `${cost:.6f}`")
-                            st.write(chunk["text"])
-
-                if run_eval and retrieved_chunks:
-                    with st.status("Running DeepEval evaluation...", expanded=True) as eval_status:
-                        eval_data_to_save, eval_error_to_save = run_live_eval(prompt, answer, retrieved_chunks)
-                        if eval_data_to_save:
-                            st.session_state.evals.append(eval_data_to_save)
-                            eval_status.update(label="DeepEval evaluation complete", state="complete")
-                            st.info(
-                                f"🔬 **Eval Complete (deepeval)** — "
-                                f"Faithfulness: {eval_data_to_save['faithfulness']:.2f} | "
-                                f"Relevance: {eval_data_to_save['answer_relevancy']:.2f}"
-                            )
-                        else:
-                            eval_status.update(label="DeepEval evaluation failed", state="error")
-                            st.warning(f"⚠️ **Eval Failed:** {eval_error_to_save}")
-
-                st.session_state.latency_spans.append({"query": prompt, "cache_hit": True, **state.get("timings", {})})
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": processed_sources,
-                    "eval": eval_data_to_save,
-                    "eval_error": eval_error_to_save,
-                    "timings": state.get("timings", {}),
-                    "cache_hit": cache_hit,
-                    "cache_similarity": cache_similarity,
-                })
-                st.stop()
-
-            st.write("Router: classifying intent and expanding the query")
-            started = time.perf_counter()
-            route_update = router_node(state)
-            state.update(route_update)
-            state["timings"]["router"] = route_update.get("timings", {}).get("router", _elapsed_ms(started))
-            st.write(f"Route selected: `{state['route']}`")
-
-            if state.get("route") == "greeting":
-                answer = "Hi! I am CiteMentor. I can offer advice based on my curated library of non-fiction books covering finance, philosophy, and relationships. How can I help you today?"
-                status.update(label="Greeting handled", state="complete")
-                st.write(answer)
-                st.session_state.latency_spans.append({"query": prompt, **state.get("timings", {})})
-                st.session_state.messages.append({"role": "assistant", "content": answer, "timings": state.get("timings", {})})
-                st.stop()
-
-            if state.get("route") == "out_of_scope":
-                answer = "This topic falls outside my curated non-fiction library. Please consult external resources."
-                status.update(label="Out-of-scope route handled", state="complete")
-                st.info("Badge: Public Domain Knowledge (Zero Charge)")
-                st.write(answer)
-                st.session_state.latency_spans.append({"query": prompt, **state.get("timings", {})})
-                st.session_state.messages.append({"role": "assistant", "content": answer, "timings": state.get("timings", {})})
-                st.session_state.gaps_log.append({"query": prompt})
-                st.stop()
-
-            st.write("Retriever: running semantic search, BM25, fusion, and reranking")
-            started = time.perf_counter()
-            retrieval_update = retriever_node(state)
-            state.update(retrieval_update)
-            state["timings"].update(retrieval_update.get("timings", {}))
-            state["timings"]["retriever"] = retrieval_update.get("timings", {}).get("retriever", _elapsed_ms(started))
-            retrieved_chunks = state.get("retrieved_chunks", [])
-            st.write(f"Retriever returned `{len(retrieved_chunks)}` final source chunks")
-
-            st.write("Synthesizer: streaming grounded answer")
-
+        status = st.status("Running CiteMentor pipeline...", expanded=True)
         answer_placeholder = st.empty()
         streamed_answer = ""
-        started = time.perf_counter()
-        for token in stream_synthesis_answer(state):
-            streamed_answer += token
-            answer_placeholder.markdown(streamed_answer + "▌")
-        _merge_timings(state, {"synthesis": _elapsed_ms(started)})
+        synthesis_announced = False
+        final = {}
 
-        started = time.perf_counter()
-        output_check = check_output_safety(streamed_answer, state.get("retrieved_chunks", []))
-        _merge_timings(state, {"output_guard": _elapsed_ms(started)})
-        if not output_check["is_safe"]:
-            streamed_answer = f"I cannot safely return that answer: {output_check['reason']}"
-            st.warning("Output guardrail revised the response before saving it.")
+        # Drive the compiled LangGraph: "updates" powers the status panel,
+        # "custom" carries streamed synthesis tokens from get_stream_writer().
+        for mode, chunk in app_graph.stream(
+            {"query": prompt, "timings": {}}, stream_mode=["updates", "custom"]
+        ):
+            if mode == "custom":
+                if not synthesis_announced:
+                    status.write("Synthesizer: streaming grounded answer")
+                    synthesis_announced = True
+                streamed_answer += chunk
+                answer_placeholder.markdown(streamed_answer + "▌")
+                continue
 
-        answer_placeholder.markdown(streamed_answer)
-        status.update(label="Pipeline complete", state="complete")
-        result = {**state, "answer": streamed_answer}
+            for node, update in chunk.items():
+                update = update or {}
+                final.update(update)
 
-        retrieved_chunks = result.get("retrieved_chunks", [])
+                message = NODE_STATUS_MESSAGES.get(node)
+                if message:
+                    status.write(message)
+                if node == "cache_lookup" and final.get("cache_hit"):
+                    status.write(
+                        f"Semantic cache hit ({final.get('cache_similarity', 0.0):.2f} similarity)"
+                    )
+                if node == "router":
+                    status.write(f"Route selected: `{final.get('route')}`")
+                if node == "retriever":
+                    status.write(
+                        f"Retriever returned `{len(final.get('retrieved_chunks', []))}` final source chunks"
+                    )
 
+        # Reconcile final answer: output guard may revise it, and cache hits /
+        # terminal routes never stream tokens.
+        answer = final.get("answer", streamed_answer)
+        cache_hit = bool(final.get("cache_hit", False))
+        cache_similarity = float(final.get("cache_similarity", 0.0))
+        retrieved_chunks = final.get("retrieved_chunks", [])
+        route = final.get("route")
+        timings = final.get("timings", {})
+
+        if final.get("is_safe") is False:
+            answer_placeholder.error(answer)
+            status.update(label="Blocked by input guardrail", state="error")
+        elif cache_hit:
+            answer_placeholder.markdown(answer)
+            status.update(label=f"Served from semantic cache ({cache_similarity:.2f})", state="complete")
+            st.caption(f"Semantic cache hit from: {final.get('matched_query', prompt)}")
+        else:
+            answer_placeholder.markdown(answer)
+            status.update(label="Pipeline complete", state="complete")
+            if final.get("output_is_safe") is False:
+                st.warning("Output guardrail revised the response before saving it.")
+
+        if route == "out_of_scope":
+            st.info("Badge: Public Domain Knowledge (Zero Charge)")
+            st.session_state.gaps_log.append({"query": prompt})
+
+        # Source cards + micro-royalty ledger (UI concern, reads final state).
         if retrieved_chunks:
             st.markdown("---")
             st.markdown("### 📚 Source Citations & Ledger")
-            
             for chunk in retrieved_chunks:
                 cost = record_transaction(st.session_state, chunk["book_id"])
-                chunk["cost"] = cost 
+                chunk["cost"] = cost
                 processed_sources.append(chunk)
-                
                 title = catalog_data.get(chunk["book_id"], {}).get("title", chunk["book_id"])
                 with st.expander(f"📖 {title} | Author: {chunk['author']}"):
                     st.markdown(f"**Snippet Cost:** `${cost:.6f}`")
                     st.write(chunk["text"])
-
-        if retrieved_chunks and output_check["is_safe"]:
-            started = time.perf_counter()
-            try:
-                get_answer_cache().store(prompt, result["answer"], retrieved_chunks)
-            except Exception as cache_error:
-                st.caption(f"Semantic cache store skipped: {type(cache_error).__name__}")
-            _merge_timings(state, {"semantic_cache_store": _elapsed_ms(started)})
 
         # --- LIVE EVALUATION ---
         if run_eval and retrieved_chunks:
             with st.status("Running DeepEval evaluation...", expanded=True) as eval_status:
                 st.write("Evaluating faithfulness against retrieved contexts")
                 st.write("Evaluating answer relevancy against the user query")
-                eval_data_to_save, eval_error_to_save = run_live_eval(prompt, result["answer"], retrieved_chunks)
+                eval_data_to_save, eval_error_to_save = run_live_eval(prompt, answer, retrieved_chunks)
                 if eval_data_to_save:
                     st.session_state.evals.append(eval_data_to_save)
                     eval_status.update(label="DeepEval evaluation complete", state="complete")
@@ -332,16 +244,16 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
                     st.warning(f"⚠️ **Eval Failed:** {eval_error_to_save}")
 
         # Save state
-        st.session_state.latency_spans.append({"query": prompt, "cache_hit": cache_hit, **state.get("timings", {})})
+        st.session_state.latency_spans.append({"query": prompt, "cache_hit": cache_hit, **timings})
         st.session_state.messages.append({
-            "role": "assistant", 
-            "content": result["answer"],
+            "role": "assistant",
+            "content": answer,
             "sources": processed_sources,
             "eval": eval_data_to_save,
             "eval_error": eval_error_to_save,
-            "timings": state.get("timings", {}),
+            "timings": timings,
             "cache_hit": cache_hit,
             "cache_similarity": cache_similarity,
         })
-        
+
         st.rerun()

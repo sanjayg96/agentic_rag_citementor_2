@@ -100,8 +100,8 @@ st.markdown("### Architecture at a glance")
 architecture = [
     ("Offline ingestion", "PDF parsing, chunking, contextual summaries, embeddings, Chroma persistence, and BM25 indexing."),
     ("Guardrails", "Lightweight input and output checks for sensitive data, prompt-injection patterns, and ungrounded responses."),
+    ("Semantic cache", "Runs right after the input guardrail and short-circuits to a prior grounded answer when a new query is semantically similar enough, skipping routing and retrieval."),
     ("Router", "Classifies each query and generates retrieval expansions in one structured call."),
-    ("Semantic cache", "Reuses prior grounded answers when a new query is semantically similar enough."),
     ("Retriever", "Combines semantic and lexical search, deduplicates evidence, fuses rankings, and reranks candidates."),
     ("Synthesizer", "Generates an answer using only retrieved context and returns source-backed mentorship."),
     ("Observability", "Tracks DeepEval scores, latency spans, library gaps, and per-session micro-royalty transactions."),

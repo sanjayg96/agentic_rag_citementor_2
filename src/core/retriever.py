@@ -12,6 +12,7 @@ load_dotenv()
 
 # Paths
 CONFIG_PATH = Path("config/retrieval.yaml")
+CATALOG_PATH = Path("catalog.json")
 CHROMA_DIR = Path("storage/chroma_db")
 BM25_DIR = Path("storage/bm25/bm25_index.pkl")
 
@@ -22,6 +23,11 @@ class HybridRetriever:
             
         self.retrieval_cfg = self.config["retrieval"]
         self.inference_mode = self.config["system"].get("inference_mode", "local")
+
+        # Genres available for router-scoped retrieval (from the book catalog).
+        with open(CATALOG_PATH, "r") as f:
+            catalog = json.load(f)
+        self.genres = {meta.get("genre") for meta in catalog.values() if meta.get("genre")}
         
         # 1. Connect to the collection that matches the active embedding space.
         self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
@@ -114,28 +120,29 @@ class HybridRetriever:
         fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [chunk_map[chunk_id] for chunk_id, _ in fused]
 
-    def retrieve(self, queries: List[str]) -> List[Dict[str, Any]]:
-        """Executes Hybrid Search across multiple expanded queries."""
-        started_total = time.perf_counter()
+    def _gather_candidates(self, queries: List[str], genre: str | None):
+        """Runs semantic + lexical search across queries, optionally scoped to a genre."""
         semantic_ms = 0.0
         lexical_ms = 0.0
-        fusion_ms = 0.0
-        reranker_ms = 0.0
         all_vector_results = []
         all_bm25_results = []
-        
         seen_vector_ids = set()
         seen_bm25_ids = set()
+        where = {"genre": genre} if genre else None
+        lexical_top_k = self.retrieval_cfg["lexical_top_k"]
 
         for query in queries:
             # --- A. Semantic Search (Chroma) ---
             started = time.perf_counter()
-            vector_res = self.collection.query(
-                query_texts=[query],
-                n_results=self.retrieval_cfg["semantic_top_k"]
-            )
+            query_kwargs = {
+                "query_texts": [query],
+                "n_results": self.retrieval_cfg["semantic_top_k"],
+            }
+            if where:
+                query_kwargs["where"] = where
+            vector_res = self.collection.query(**query_kwargs)
             semantic_ms += (time.perf_counter() - started) * 1000
-            
+
             for idx, chunk_id in enumerate(vector_res["ids"][0]):
                 if chunk_id not in seen_vector_ids:
                     all_vector_results.append({
@@ -150,17 +157,22 @@ class HybridRetriever:
             started = time.perf_counter()
             tokenized_query = query.split()
             bm25_scores = self.bm25_model.get_scores(tokenized_query)
-            top_n_indices = bm25_scores.argsort()[::-1][:self.retrieval_cfg["lexical_top_k"]]
 
+            # Walk scores high-to-low, keeping only in-genre hits when scoped,
+            # until we have lexical_top_k fresh candidates for this query.
             candidate_metadata = []
             missing_ids = []
-            for idx in top_n_indices:
+            for idx in bm25_scores.argsort()[::-1]:
                 meta = self.bm25_metadata[idx]
+                if genre and meta.get("genre") != genre:
+                    continue
                 chunk_id = f"{meta['book_id']}_chunk_{meta['chunk_index']}"
-
-                if chunk_id not in seen_bm25_ids:
-                    candidate_metadata.append((chunk_id, meta))
-                    missing_ids.append(chunk_id)
+                if chunk_id in seen_bm25_ids or any(c == chunk_id for c, _ in candidate_metadata):
+                    continue
+                candidate_metadata.append((chunk_id, meta))
+                missing_ids.append(chunk_id)
+                if len(candidate_metadata) >= lexical_top_k:
+                    break
 
             # Fetch BM25 documents from Chroma in one batch instead of one DB call per hit.
             if missing_ids:
@@ -182,11 +194,33 @@ class HybridRetriever:
                         seen_bm25_ids.add(chunk_id)
             lexical_ms += (time.perf_counter() - started) * 1000
 
+        return all_vector_results, all_bm25_results, semantic_ms, lexical_ms
+
+    def retrieve(self, queries: List[str], route: str | None = None) -> List[Dict[str, Any]]:
+        """Executes Hybrid Search, scoped to the routed genre with a global fallback."""
+        started_total = time.perf_counter()
+        reranker_ms = 0.0
+
+        # Only scope when the router picked a real catalog genre.
+        genre = route if route in self.genres else None
+
+        all_vector_results, all_bm25_results, semantic_ms, lexical_ms = self._gather_candidates(queries, genre)
+
         # --- C. Reciprocal Rank Fusion ---
         started = time.perf_counter()
         fused_results = self._reciprocal_rank_fusion(all_vector_results, all_bm25_results)
         fusion_ms = (time.perf_counter() - started) * 1000
-        
+
+        # Fallback: a genre-scoped search that came up short (e.g. router
+        # misclassification) re-runs against the whole library.
+        if genre and len(fused_results) < self.retrieval_cfg["final_top_n"]:
+            all_vector_results, all_bm25_results, sem2, lex2 = self._gather_candidates(queries, None)
+            semantic_ms += sem2
+            lexical_ms += lex2
+            started = time.perf_counter()
+            fused_results = self._reciprocal_rank_fusion(all_vector_results, all_bm25_results)
+            fusion_ms += (time.perf_counter() - started) * 1000
+
         if not fused_results:
             self.last_timings = {
                 "semantic_search": round(semantic_ms, 2),
