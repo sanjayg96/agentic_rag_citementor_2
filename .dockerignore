@@ -1,0 +1,36 @@
+# Keep the Lambda image lean — only ship code, config, and the prebuilt indexes.
+
+# Source PDFs are only used for (re)ingestion, never at query time.
+data/
+
+# Local envs / tooling / VCS
+.venv/
+venv/
+.git/
+.github/
+.gitignore
+.python-version
+uv.lock
+
+# Streamlit UI and docs are not part of the API image
+main.py
+src/pages/
+docs/
+
+# Secrets — never bake into the image (injected via env / Secrets Manager)
+.env
+.env.*
+!service/.env.example
+
+# Python / OS cruft
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Terraform (added in Phase 5)
+infra/.terraform/
+*.tfstate
+*.tfstate.*

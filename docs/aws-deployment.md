@@ -58,8 +58,8 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 ## Progress Tracker
 
 - [x] **Pre-step** — commit dev changes, create `aws-deploy`, commit this tracker
-- [ ] **Phase 0** — Extract FastAPI service (`POST /query`, `GET /health`)
-- [ ] **Phase 1** — Containerize (ARM64), run & verify locally
+- [x] **Phase 0** — Extract FastAPI service (`POST /query`, `GET /health`)
+- [x] **Phase 1** — Containerize (ARM64), run & verify locally
 - [ ] **Phase 2** — Bundle ChromaDB, `/tmp` copy on cold start, verify retrieval parity
 - [ ] **Phase 3** — ECR + Lambda (container, ARM64) + API Gateway, end-to-end live
 - [ ] **Phase 4** — Secrets Manager for `OPENAI_API_KEY`, least-priv read at cold start
@@ -127,8 +127,20 @@ New `service/` dir importing the existing core unchanged:
 
 - **2026-06-16** — Pre-step done: committed dev changes (vector DB rebuild, book corpus, genre
   backfill util, `.gitignore` for `.DS_Store`/Terraform, untracked stray `.DS_Store`), created
-  `aws-deploy` off `dev`, added this tracker. Next: Phase 0 (FastAPI extraction) + Phase 1
-  (containerize), then pause for review.
+  `aws-deploy` off `dev`, added this tracker.
+- **2026-06-16** — **Phase 0 done.** `service/app.py` (Mangum), slim `service/requirements.txt`,
+  `service/.env.example`. Verified via uvicorn: `/health` ok; `/query` grounded answer + 3 sources
+  + timings; repeat → cache hit (sim ~1.0); empty query → 422.
+- **2026-06-16** — **Phase 1 done.** `service/Dockerfile` (`public.ecr.aws/lambda/python:3.12-arm64`)
+  + `.dockerignore`. Built `docker buildx build --platform linux/arm64 -f service/Dockerfile -t
+  citementor-api:local .` → **arm64/linux**, **~1.5GB** (base image + chromadb's onnxruntime + 75MB
+  corpus; later slimming candidate). Ran via Lambda RIE: `GET /health` → 200; `POST /query` → 200,
+  grounded answer + 3 sources. **Cold-start data:** module INIT ~265ms (retriever is lazy); first
+  `/query` ~26.4s (retriever build + Chroma/BM25 load + OpenAI embed/retrieve + gpt-5-mini synthesis
+  ~12s). RIE ran at 3008MB. **Implications for Phase 3:** Lambda timeout must be ≥30s (default 3s
+  fails); size memory ~2–3GB; provisioned concurrency or a warmup ping would hide cold starts.
+  **Paused for review.** Next: Phase 2 (Chroma → /tmp on cold start, env-overridable `CHROMA_DIR`,
+  retrieval parity check).
 
 ## Working notes
 
