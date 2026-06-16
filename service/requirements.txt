@@ -1,0 +1,29 @@
+# CiteMentor API — slim, OpenAI-only dependency set for the Lambda container.
+#
+# Deliberately EXCLUDES the heavy local-inference / eval / UI deps from the root
+# pyproject.toml (torch, torchvision, sentence-transformers, mlx-lm,
+# mlx-embedding-models, einops, deepeval, streamlit). In inference_mode=openai
+# with use_llm_reranker=false these are never imported at runtime, so dropping
+# them takes the image from ~2GB to a few hundred MB and speeds up cold starts.
+#
+# Core versions pinned to match the project's uv.lock for parity with the
+# Streamlit deployment.
+
+# --- Web / Lambda adapter ---
+fastapi==0.118.0
+uvicorn==0.34.0          # local/dev server only; unused on Lambda (Mangum handles it)
+mangum==0.19.0           # ASGI -> Lambda event adapter
+
+# --- RAG pipeline (matches uv.lock) ---
+langchain==1.2.15
+langchain-openai==1.2.1
+langchain-core==1.3.2
+langgraph==1.1.9
+chromadb==1.5.8
+rank-bm25==0.2.2
+openai==2.32.0
+
+# --- Support libs ---
+pydantic==2.13.3
+pyyaml==6.0.3
+python-dotenv==1.2.2
