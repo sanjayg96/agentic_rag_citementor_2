@@ -18,6 +18,12 @@ from fastapi import FastAPI
 from mangum import Mangum
 from pydantic import BaseModel, Field
 
+# Populate OPENAI_API_KEY from Secrets Manager (Lambda) before anything reads it.
+# No-op locally where the key is already in the environment (.env).
+from service.secrets import load_openai_key_from_secrets
+
+load_openai_key_from_secrets()
+
 # Importing app_graph runs graph.py's module-level setup (loads catalog/config/
 # prompts, calls load_dotenv). The retriever and answer cache stay lazy — they
 # are only constructed on the first /query, so /health never touches them.
