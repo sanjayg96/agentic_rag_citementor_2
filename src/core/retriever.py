@@ -8,12 +8,13 @@ from typing import List, Dict, Any
 import chromadb
 from dotenv import load_dotenv
 
+from src.core.storage import resolve_chroma_path
+
 load_dotenv()
 
 # Paths
 CONFIG_PATH = Path("config/retrieval.yaml")
 CATALOG_PATH = Path("catalog.json")
-CHROMA_DIR = Path("storage/chroma_db")
 BM25_DIR = Path("storage/bm25/bm25_index.pkl")
 
 class HybridRetriever:
@@ -30,7 +31,7 @@ class HybridRetriever:
         self.genres = {meta.get("genre") for meta in catalog.values() if meta.get("genre")}
         
         # 1. Connect to the collection that matches the active embedding space.
-        self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        self.chroma_client = chromadb.PersistentClient(path=resolve_chroma_path())
         collection_name = self.config["vector_stores"]["local_collection"]
         if self.inference_mode == "openai":
             collection_name = self.config["vector_stores"]["openai_collection"]

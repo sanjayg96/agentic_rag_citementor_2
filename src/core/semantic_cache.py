@@ -8,10 +8,11 @@ import chromadb
 import yaml
 from dotenv import load_dotenv
 
+from src.core.storage import resolve_chroma_path
+
 load_dotenv()
 
 CONFIG_PATH = Path("config/retrieval.yaml")
-CHROMA_DIR = Path("storage/chroma_db")
 
 
 class SemanticAnswerCache:
@@ -21,7 +22,7 @@ class SemanticAnswerCache:
 
         self.inference_mode = self.config["system"].get("inference_mode", "local")
         self.threshold = float(self.config.get("cache", {}).get("similarity_threshold", 0.88))
-        self.client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        self.client = chromadb.PersistentClient(path=resolve_chroma_path())
         self.embedding_function = self._build_embedding_function()
         self.collection = self.client.get_or_create_collection(
             name=f"citementor_answer_cache_{self.inference_mode}",
