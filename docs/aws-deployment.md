@@ -67,7 +67,7 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 - [x] **Phase 2** — Bundle ChromaDB, `/tmp` copy on cold start, verify retrieval parity
 - [x] **Phase 3** — ECR + Lambda (container, ARM64) + **Lambda Function URL** (was API Gateway), end-to-end live
 - [x] **Phase 4** — Secrets Manager for `OPENAI_API_KEY`, least-priv read at cold start
-- [ ] **Phase 5** — Terraform for the whole stack; verify destroy/apply lifecycle
+- [x] **Phase 5** — Terraform for the whole stack; verify destroy/apply lifecycle
 - [ ] **Phase 6** — GitHub Actions CI/CD (OIDC, ARM64 buildx)
 - [ ] **Phase 7** — Langfuse tracing + CloudWatch alarms + Budget alert
 - [ ] **Phase 8** — Streamlit optionally calls the deployed API (env-driven), graceful degradation
@@ -200,6 +200,28 @@ New `service/` dir importing the existing core unchanged:
   so it may live in terminal scrollback / flush to `~/.zsh_history` on shell exit — **rotate the
   OpenAI key**, `put-secret-value` the new value (no redeploy needed), revoke the old key.
   **Paused for review.** Next: Phase 5 (Terraform — the reproducible apply/destroy lifecycle).
+- **2026-06-24** — **Phase 5 done (full lifecycle proven).** Installed Terraform 1.15.6.
+  Authored `infra/` (`versions/providers/variables/locals/ecr/secrets/iam/lambda/outputs.tf`
+  + `terraform.tfvars.example` + `README.md`) defining the *entire* stack: ECR repo, the
+  ARM64 image build/push (a `null_resource` running the same `docker buildx
+  --provenance=false --push`), `data.aws_ecr_image` to pin the Lambda to the immutable
+  **digest** (not `:latest`, so rebuilds actually roll the function), Secrets Manager
+  container, least-priv IAM role, Lambda (Image/arm64/3008MB/120s) + Function URL
+  (`AWS_IAM`), and an explicit CloudWatch log group. **Secret hygiene:** Terraform manages
+  only the empty secret container; the value is pushed by a `null_resource` whose shell
+  reads `$OPENAI_API_KEY` from the env at apply time (`$${OPENAI_API_KEY}` heredoc → literal
+  shell var), so **no plaintext ever lands in local state**. **Teardown-by-design:** ECR
+  `force_delete=true`, secret `recovery_window_in_days=0`, managed log group. **Verified
+  live:** deleted the Phase 0-4 manually-created resources, then `terraform apply` rebuilt
+  the identical stack from nothing (10 resources, new Function URL). Ran the demo —
+  `--health` → ok, `--warm` → cold start paid, a real question → grounded cited answer
+  (warm ~18s: router 5.1s / retriever 3.5s / synthesis 10.0s). Then `terraform destroy` (10
+  resources) and confirmed Lambda/ECR/secret/role/log-group all **not found** → spend ~$0.
+  **State is local + gitignored** (`*.tfstate*`); the `.tf` files are committed.
+  **Comprehensive guide written:** `docs/DEPLOYMENT.md` (story, theory, AWS-services
+  glossary, request lifecycle, per-phase narrative, code walkthrough, Terraform stack, cost
+  model, security model, lessons) — to be extended each remaining phase. **Paused for
+  review.** Next: Phase 6 (GitHub Actions CI/CD with OIDC, ARM64 buildx).
 
 ## Working notes
 
