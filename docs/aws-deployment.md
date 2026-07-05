@@ -53,9 +53,18 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
    is too short for cold starts (~49s) and even some warm LLM syntheses (>30s). The Function URL
    honours the function's own 120s timeout. This account blocks *anonymous* function URLs, so auth
    is `AWS_IAM` and requests are SigV4-signed (helper: `scripts/demo_query.sh`). No token streaming.
-2. **OpenAI-only slim container** — drop local-mode/eval/UI deps.
+2. **OpenAI-only slim container** — drop local-mode/eval/UI deps. (Now also carries a
+   `langchain-aws` dep for the optional **bedrock** mode; still excludes torch/MLX/etc.)
 3. **ARM64/Graviton** end-to-end (local M-series build → ARM64 Lambda).
 4. Commit existing `dev` changes first, branch `aws-deploy` — **done**.
+5. **Third inference mode: `bedrock`** (added post-Phase-5). A zero-OpenAI-dependency
+   fallback for when the OpenAI balance runs out (Bedrock has no upfront cost, billed on
+   the monthly AWS invoice). Models: **Claude 3 Haiku** (router + synthesis, on-demand) +
+   **Titan Text Embeddings V2**. Because Chroma binds an embedder to a collection, the
+   corpus is re-embedded with Titan into `citementor_library_bedrock` (cheap re-embed of
+   already-enriched chunks, no LLM calls). Switch via config edit + rebuild (no env-var
+   toggle). Requires a one-time **Bedrock model-access** grant in the console. Full
+   theory in `docs/DEPLOYMENT.md`.
 
 ---
 

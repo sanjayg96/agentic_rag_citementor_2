@@ -162,6 +162,7 @@ returns JSON. Logs flow to CloudWatch. `terraform destroy` removes all of it.
 | **Secrets Manager** | Encrypted store for secrets with fine-grained IAM access + rotation. | Holds `OPENAI_API_KEY`. The key is fetched at cold start, never baked into the image or Terraform state. |
 | **CloudWatch Logs** | Centralized logs (and metrics/alarms). | Lambda's stdout/stderr land here. Managed explicitly so retention is bounded and `destroy` cleans them up. |
 | **STS / SigV4** | Temporary creds + the AWS request-signing algorithm. | `AWS_IAM` auth on the Function URL means every request is SigV4-signed; the caller's IAM identity authorizes it. |
+| **Bedrock** *(optional mode)* | Managed access to foundation models (Anthropic, Amazon, etc.) via one API, pay-per-token, no upfront cost. | Powers `inference_mode: bedrock` (Claude 3 Haiku + Titan V2) — an OpenAI-independent fallback billed on the AWS invoice. See the Bedrock add-on in §6. |
 | *(considered, rejected)* **API Gateway** | Managed API front door (routing, auth, throttling). | Rejected: hard 30s integration timeout < our cold start. Left as a documented trade-off. |
 
 **Region:** `ap-south-1` (Mumbai). **Account:** `505192030409`.
@@ -395,6 +396,64 @@ deleted, then `terraform apply` recreated the **identical** stack from scratch.
 resources) → confirmed Lambda, ECR, secret, role, and log group all **not found** → AWS
 spend back to ~\$0.
 
+### Add-on — Bedrock mode (an OpenAI-independent fallback)
+
+**The problem it solves.** The stack runs `inference_mode: openai`, which needs a funded
+OpenAI account. When that balance hits \$0 you must top it up (min \$5) just to run a
+one-off demo. **AWS Bedrock has no upfront cost** — usage is billed on the same monthly
+AWS invoice, and at this project's rare-demo volume it's negligible. So we added a third
+`inference_mode: "bedrock"` that runs the **entire pipeline on Bedrock with zero OpenAI
+dependency**.
+
+**Models (in `ap-south-1`):**
+- **Router + synthesis:** Anthropic **Claude 3 Haiku** (`anthropic.claude-3-haiku-20240307-v1:0`)
+  — *on-demand* (no cross-region inference profile needed), so the IAM is a single simple
+  model ARN. ~\$0.25/\$1.25 per 1M tokens.
+- **Embeddings:** **Amazon Titan Text Embeddings V2** (`amazon.titan-embed-text-v2:0`).
+
+**The one hard constraint — embedding spaces don't mix.** ChromaDB binds an embedding
+model to a collection at creation time. The corpus lives in `citementor_library_openai`,
+embedded with OpenAI `text-embedding-3-small` (1536-dim). A Titan query vector (different
+model, different space) **cannot** search that collection — it returns garbage. So Bedrock
+mode needs its **own** collection, `citementor_library_bedrock`, embedded with Titan.
+
+**Building that collection is cheap.** The enriched chunk texts (with their contextual
+summaries) already live in the local collection, so we don't re-run any LLM
+summarization — we just **re-embed** the existing 2 800 chunks with Titan. `ingestion.py`
+already had `rebuild_openai_from_existing()`; it was generalized to
+`rebuild_from_existing(target_profile, ...)`, and `--profile=bedrock` routes through it.
+Cost: 2 800 Titan embed calls ≈ a fraction of a cent, **no OpenAI calls**.
+
+**How the code branches (mirrors the existing openai/local pattern):**
+- `config/retrieval.yaml` — a `bedrock:` block (region + model ids) and
+  `vector_stores.bedrock_collection`.
+- `src/core/graph.py` — a `get_bedrock_llm()` factory (`langchain_aws.ChatBedrockConverse`)
+  plus `bedrock` branches in the router (structured output via the default tool method,
+  not OpenAI's `json_schema`) and synthesis (streaming; a small `_content_to_text()`
+  normalizes Bedrock's content-block chunks to plain text).
+- `src/core/retriever.py` / `semantic_cache.py` — a `bedrock` branch selecting the Titan
+  `AmazonBedrockEmbeddingFunction` and the bedrock collection / cache
+  (`citementor_answer_cache_bedrock`). Bedrock takes the same no-cross-encoder path as
+  openai (the slim image has no sentence-transformers).
+- `service/requirements.txt` — adds `langchain-aws==1.4.6` (compatible with the pinned
+  `langchain-core==1.3.2`; pulls boto3 transitively). Imported lazily, inert in openai mode.
+- `infra/iam.tf` — a least-privilege inline policy granting `bedrock:InvokeModel[WithResponseStream]`
+  on **only** the two model ARNs. Harmless in openai mode, so always attached.
+- The guardrails are pure regex (no LLM), so nothing else touches a provider.
+
+**Two operational notes:**
+1. **Model access is a one-time manual grant.** IAM permission is necessary but not
+   sufficient — you must enable access to Claude 3 Haiku and Titan V2 once in the Bedrock
+   console (Model access). Otherwise `InvokeModel` returns AccessDenied.
+2. **Switching modes = config edit + rebuild.** Set `inference_mode: bedrock` in
+   `config/retrieval.yaml`, then `terraform apply` (the config change bumps the build hash,
+   so the image is rebuilt+pushed and the Lambda rolls forward). Revert + apply to go back.
+   No env-var toggle — one source of truth, at the cost of a ~3-minute rebuild per switch.
+
+**Credentials.** Bedrock mode uses no API key: locally the boto3 default chain reads your
+`aws configure` profile; on Lambda it's the execution role. This is *why* it's the perfect
+"OpenAI ran out" escape hatch — nothing to fund, nothing to inject.
+
 ---
 
 ## 7. Code walkthrough — how the app is wired
@@ -543,11 +602,14 @@ The design target is **\$0 at rest**.
 | ECR image (~340 MB stored) | ~\$0.03–0.15 / month | — |
 | Secrets Manager (1 secret) | ~\$0.40 / month + \$0.05 / 10k API calls | per cold-start fetch (negligible) |
 | CloudWatch Logs | ~\$0 at this volume (14-day retention) | log ingestion (negligible) |
-| OpenAI API | — | per query (embeddings + `gpt-5-nano` router + `gpt-5-mini` synthesis) |
+| OpenAI API *(openai mode)* | — | per query (embeddings + `gpt-5-nano` router + `gpt-5-mini` synthesis) |
+| Bedrock *(bedrock mode)* | \$0 (no upfront, no reservation) | per query (Titan V2 embeddings + Claude 3 Haiku router+synthesis); on the monthly AWS invoice |
 
 **The two standing charges while applied are ECR and Secrets Manager — together well
 under \$1/month.** `terraform destroy` removes even those, taking AWS spend to ~\$0. The
-only ongoing variable cost is OpenAI usage, which is per-query.
+only ongoing variable cost is the LLM provider, per-query. **Bedrock mode's whole appeal
+is that its per-query cost has _no upfront minimum_** — unlike OpenAI's \$5 top-up — so a
+one-off demo when the OpenAI balance is empty costs literal cents on the AWS bill.
 
 ---
 
@@ -648,4 +710,24 @@ This document grows with the project. Planned additions:
   replace `AdministratorAccess`; complete the architecture/runbook/cost/observability
   reference.
 
-> _Last updated: 2026-06-24 — covers Phases 0–5._
+### The intended demo flow (Phases 6 + 8) — run everything from GitHub
+
+Once CI/CD (Phase 6) and the Streamlit integration (Phase 8) land, giving a demo becomes:
+
+1. GitHub → **Actions** → run a **"Deploy"** workflow (manual `workflow_dispatch`) → it runs
+   `terraform apply` → the stack comes up.
+2. Warm up, then give the demo on **Streamlit** (the Streamlit app calls the deployed API).
+3. Run a **"Teardown"** workflow → `terraform destroy` → cost back to **\$0**.
+
+**Two design implications this forces (they refine earlier decisions):**
+- **Terraform state must move to a remote backend (S3 + a DynamoDB lock table).** Today
+  state is local and gitignored. Two *separate* CI runs — apply now, destroy later — are
+  ephemeral and cannot share local state, so the apply/destroy-by-workflow model requires
+  remote state. Auth from GitHub via **OIDC** (a short-lived assumed role), never
+  long-lived keys.
+- **Streamlit → Function URL auth.** The URL is `AWS_IAM`, so the Streamlit app must
+  SigV4-sign its requests using AWS credentials stored as Streamlit secrets (or we add a
+  separate public-auth front door). A Phase 8 detail, but it's why the endpoint isn't just
+  a plain public URL.
+
+> _Last updated: 2026-07-05 — covers Phases 0–5 + the Bedrock inference mode._
