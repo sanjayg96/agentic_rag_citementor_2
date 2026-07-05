@@ -162,7 +162,7 @@ returns JSON. Logs flow to CloudWatch. `terraform destroy` removes all of it.
 | **Secrets Manager** | Encrypted store for secrets with fine-grained IAM access + rotation. | Holds `OPENAI_API_KEY`. The key is fetched at cold start, never baked into the image or Terraform state. |
 | **CloudWatch Logs** | Centralized logs (and metrics/alarms). | Lambda's stdout/stderr land here. Managed explicitly so retention is bounded and `destroy` cleans them up. |
 | **STS / SigV4** | Temporary creds + the AWS request-signing algorithm. | `AWS_IAM` auth on the Function URL means every request is SigV4-signed; the caller's IAM identity authorizes it. |
-| **Bedrock** *(optional mode)* | Managed access to foundation models (Anthropic, Amazon, etc.) via one API, pay-per-token, no upfront cost. | Powers `inference_mode: bedrock` (Claude 3 Haiku + Titan V2) — an OpenAI-independent fallback billed on the AWS invoice. See the Bedrock add-on in §6. |
+| **Bedrock** *(optional mode)* | Managed access to foundation models (Amazon Nova, Anthropic, etc.) via one API, pay-per-token, no upfront cost. | Powers `inference_mode: bedrock` (Amazon Nova Lite+Pro + Titan V2) — an OpenAI-independent fallback billed on the AWS invoice. See the Bedrock add-on in §6. |
 | *(considered, rejected)* **API Gateway** | Managed API front door (routing, auth, throttling). | Rejected: hard 30s integration timeout < our cold start. Left as a documented trade-off. |
 
 **Region:** `ap-south-1` (Mumbai). **Account:** `505192030409`.
@@ -405,11 +405,28 @@ AWS invoice, and at this project's rare-demo volume it's negligible. So we added
 `inference_mode: "bedrock"` that runs the **entire pipeline on Bedrock with zero OpenAI
 dependency**.
 
-**Models (in `ap-south-1`):**
-- **Router + synthesis:** Anthropic **Claude 3 Haiku** (`anthropic.claude-3-haiku-20240307-v1:0`)
-  — *on-demand* (no cross-region inference profile needed), so the IAM is a single simple
-  model ARN. ~\$0.25/\$1.25 per 1M tokens.
+**Models (in `ap-south-1`), tiered like the openai path (cheap router, premium synthesis):**
+- **Router:** **Amazon Nova Lite** (`apac.amazon.nova-lite-v1:0`) — cheap, fast, reliable at
+  the structured-output classification the router needs. ~\$0.06/\$0.24 per 1M tokens.
+- **Synthesis:** **Amazon Nova Pro** (`apac.amazon.nova-pro-v1:0`) — the higher-quality tier
+  where the answer actually gets written. ~\$0.80/\$3.20 per 1M tokens.
 - **Embeddings:** **Amazon Titan Text Embeddings V2** (`amazon.titan-embed-text-v2:0`).
+
+> **Why Nova and not Claude? (a real war story worth telling.)** We first wired Bedrock
+> mode to **Anthropic Claude 3 Haiku** — it passed every *local* test. But on the *cloud*
+> Lambda it returned `AccessDeniedException: ... not authorized to perform the required AWS
+> Marketplace actions (aws-marketplace:Subscribe) to enable access to this model`. The
+> catch: **Anthropic models on Bedrock are third-party AWS Marketplace products**, and this
+> account's Marketplace *agreement* for Claude kept being created and **expiring in the same
+> instant** (start date == end date) — a broken subscription loop that even the admin user
+> couldn't invoke through. **Amazon Nova models are first-party**, so they need *no*
+> Marketplace subscription and are auto-enabled on first invoke. Switching router+synthesis
+> to Nova made the cloud path work immediately — and Nova is cheaper too. *Lesson: on
+> Bedrock, first-party (Amazon) vs. Marketplace (third-party) models have very different
+> enablement paths; the third-party subscription is an account-level dependency your IAM
+> can't satisfy.* The Nova models are also **cross-region inference-profile** models (the
+> `apac.` prefix), which is why the IAM (below) grants both the profile ARN and the
+> underlying regional model ARNs.
 
 **The one hard constraint — embedding spaces don't mix.** ChromaDB binds an embedding
 model to a collection at creation time. The corpus lives in `citementor_library_openai`,
@@ -438,17 +455,26 @@ Cost: 2 800 Titan embed calls ≈ a fraction of a cent, **no OpenAI calls**.
 - `service/requirements.txt` — adds `langchain-aws==1.4.6` (compatible with the pinned
   `langchain-core==1.3.2`; pulls boto3 transitively). Imported lazily, inert in openai mode.
 - `infra/iam.tf` — a least-privilege inline policy granting `bedrock:InvokeModel[WithResponseStream]`
-  on **only** the two model ARNs. Harmless in openai mode, so always attached.
+  on **only**: the Titan model ARN, the two Nova **inference-profile** ARNs, and the Nova
+  underlying foundation-model ARNs (region-wildcard, since a cross-region profile may route
+  to any of its APAC regions — still scoped to the specific model). Harmless in openai mode.
 - The guardrails are pure regex (no LLM), so nothing else touches a provider.
 
 **Two operational notes:**
-1. **Model access is a one-time manual grant.** IAM permission is necessary but not
-   sufficient — you must enable access to Claude 3 Haiku and Titan V2 once in the Bedrock
-   console (Model access). Otherwise `InvokeModel` returns AccessDenied.
+1. **Model enablement.** Amazon Nova + Titan are first-party and auto-enable on first invoke —
+   no manual step, no Marketplace subscription. (Third-party models like Anthropic Claude
+   would require a one-time Marketplace subscription completed by a marketplace-capable
+   principal — the enablement failure that made us switch to Nova; see the war story above.)
 2. **Switching modes = config edit + rebuild.** Set `inference_mode: bedrock` in
    `config/retrieval.yaml`, then `terraform apply` (the config change bumps the build hash,
    so the image is rebuilt+pushed and the Lambda rolls forward). Revert + apply to go back.
    No env-var toggle — one source of truth, at the cost of a ~3-minute rebuild per switch.
+
+**Verified live end-to-end:** `terraform apply` in bedrock mode → `demo_query.sh` returned a
+grounded, cited answer routed entirely through Nova (router `finance` ~0.6s, Titan retrieval
+~2.2s, Nova Pro synthesis ~1.3s — **~4s warm, faster than the OpenAI path**), repeat →
+`cache_hit: true` (sim 1.0) → `terraform destroy` → \$0. The whole run used an *invalid*
+OpenAI key, proving zero OpenAI dependency.
 
 **Credentials.** Bedrock mode uses no API key: locally the boto3 default chain reads your
 `aws configure` profile; on Lambda it's the execution role. This is *why* it's the perfect
@@ -603,7 +629,7 @@ The design target is **\$0 at rest**.
 | Secrets Manager (1 secret) | ~\$0.40 / month + \$0.05 / 10k API calls | per cold-start fetch (negligible) |
 | CloudWatch Logs | ~\$0 at this volume (14-day retention) | log ingestion (negligible) |
 | OpenAI API *(openai mode)* | — | per query (embeddings + `gpt-5-nano` router + `gpt-5-mini` synthesis) |
-| Bedrock *(bedrock mode)* | \$0 (no upfront, no reservation) | per query (Titan V2 embeddings + Claude 3 Haiku router+synthesis); on the monthly AWS invoice |
+| Bedrock *(bedrock mode)* | \$0 (no upfront, no reservation) | per query (Titan V2 embeddings + Nova Lite router + Nova Pro synthesis); on the monthly AWS invoice |
 
 **The two standing charges while applied are ECR and Secrets Manager — together well
 under \$1/month.** `terraform destroy` removes even those, taking AWS spend to ~\$0. The

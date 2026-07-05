@@ -59,12 +59,16 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 4. Commit existing `dev` changes first, branch `aws-deploy` — **done**.
 5. **Third inference mode: `bedrock`** (added post-Phase-5). A zero-OpenAI-dependency
    fallback for when the OpenAI balance runs out (Bedrock has no upfront cost, billed on
-   the monthly AWS invoice). Models: **Claude 3 Haiku** (router + synthesis, on-demand) +
-   **Titan Text Embeddings V2**. Because Chroma binds an embedder to a collection, the
-   corpus is re-embedded with Titan into `citementor_library_bedrock` (cheap re-embed of
-   already-enriched chunks, no LLM calls). Switch via config edit + rebuild (no env-var
-   toggle). Requires a one-time **Bedrock model-access** grant in the console. Full
-   theory in `docs/DEPLOYMENT.md`.
+   the monthly AWS invoice). Models: **Amazon Nova Lite** (router) + **Amazon Nova Pro**
+   (synthesis) + **Titan Text Embeddings V2**. *Originally Claude 3 Haiku, but Anthropic
+   Claude is a third-party AWS Marketplace model whose subscription kept expiring instantly
+   on this account (start==end date) → `AccessDenied` on the cloud Lambda even for admin.
+   Switched to first-party Amazon Nova (no Marketplace subscription, auto-enabled, cheaper).*
+   Because Chroma binds an embedder to a collection, the corpus is re-embedded with Titan
+   into `citementor_library_bedrock` (cheap re-embed of already-enriched chunks, no LLM
+   calls). Nova uses cross-region `apac.` inference profiles → IAM grants the profile ARNs
+   + underlying model ARNs. Switch via config edit + rebuild (no env-var toggle). Full
+   theory + war story in `docs/DEPLOYMENT.md`.
 
 ---
 
@@ -231,6 +235,26 @@ New `service/` dir importing the existing core unchanged:
   glossary, request lifecycle, per-phase narrative, code walkthrough, Terraform stack, cost
   model, security model, lessons) — to be extended each remaining phase. **Paused for
   review.** Next: Phase 6 (GitHub Actions CI/CD with OIDC, ARM64 buildx).
+
+- **2026-07-05** — **Bedrock inference mode added + cloud-tested.** New third `inference_mode:
+  bedrock` for zero-OpenAI-dependency demos. Re-embedded the 2800-chunk corpus with **Titan V2**
+  into `citementor_library_bedrock` via a generalized `ingestion.rebuild_from_existing` (re-embed
+  only, no LLM/OpenAI calls; ~46 min as Titan is sequential). Wired `bedrock` branches into
+  `graph.py` (`get_bedrock_llm` = `ChatBedrockConverse`; router structured-output via default tool
+  method; `_content_to_text` normalizes streaming chunks), `retriever.py`/`semantic_cache.py`
+  (Titan `AmazonBedrockEmbeddingFunction`; same no-cross-encoder path as openai). Added
+  `langchain-aws==1.4.6` (kept `langchain-core==1.3.2`). **Model saga:** started on **Claude 3
+  Haiku** — passed local tests, but the cloud Lambda hit `AccessDenied` on AWS **Marketplace**
+  actions; Anthropic Claude is a *third-party Marketplace* model and this account's agreement kept
+  **expiring instantly** (start==end), unfixable from our side (even admin invoke failed). Pivoted
+  to **first-party Amazon Nova** (Lite router + Pro synthesis, `apac.` inference profiles) — no
+  Marketplace subscription, auto-enabled, cheaper. Updated IAM (`bedrock:InvokeModel` on Titan +
+  Nova profile ARNs + underlying regional model ARNs). **Verified full cloud lifecycle:** apply
+  (11 res, image rebuilt for bedrock config) → live demo returned a grounded cited answer entirely
+  via Nova (router `finance` ~0.6s / Titan retrieval ~2.2s / Nova Pro synthesis ~1.3s → **~4s warm,
+  faster than openai**), repeat → `cache_hit` sim 1.0 → destroy (11 res) → **$0**. Whole run used
+  an invalid OpenAI key (proves zero OpenAI use). Default `inference_mode` stays `openai`; switch
+  to bedrock = edit config + `terraform apply` (rebuilds). **Next:** Phase 6 (GitHub Actions CI/CD).
 
 ## Working notes
 
