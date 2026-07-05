@@ -23,6 +23,12 @@ chromadb==1.5.8
 rank-bm25==0.2.2
 openai==2.32.0
 
+# AWS Bedrock inference mode (inference_mode: bedrock — Claude 3 Haiku + Titan V2,
+# a zero-OpenAI-dependency fallback). Pinned to a release compatible with the
+# langchain-core 1.3.2 above; pulls boto3 transitively (also on the Lambda base
+# image). Imported lazily, so it is inert when inference_mode is openai.
+langchain-aws==1.4.6
+
 # --- Support libs ---
 pydantic==2.13.3
 pyyaml==6.0.3

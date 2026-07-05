@@ -44,6 +44,16 @@ class SemanticAnswerCache:
                 model_name=self.config["openai"]["embedding_model"],
             )
 
+        if self.inference_mode == "bedrock":
+            import boto3
+
+            bedrock_cfg = self.config["bedrock"]
+            session = boto3.Session(region_name=bedrock_cfg["region"])
+            return embedding_functions.AmazonBedrockEmbeddingFunction(
+                session=session,
+                model_name=bedrock_cfg["embedding_model"],
+            )
+
         return embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=self.config["system"]["embedding_model"],
             trust_remote_code=True,

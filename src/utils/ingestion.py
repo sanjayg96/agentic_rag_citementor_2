@@ -9,10 +9,13 @@ import chromadb
 import yaml
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
 from tqdm.auto import tqdm
+
+# NOTE: langchain_community.PyPDFLoader / langchain_text_splitters are imported
+# lazily inside the PDF ingestion path only. The "existing"-source re-embed path
+# (used by the openai/bedrock profiles) reads chunks from an existing Chroma
+# collection and never needs those heavy deps.
 
 # Load environment variables from .env file
 load_dotenv()
@@ -137,6 +140,16 @@ def create_embedding_function(profile: str, config: dict):
             trust_remote_code=True,
         )
 
+    if profile == "bedrock":
+        import boto3
+
+        bedrock_cfg = config["bedrock"]
+        print(f"Using Bedrock embedding model: {bedrock_cfg['embedding_model']}...")
+        return embedding_functions.AmazonBedrockEmbeddingFunction(
+            session=boto3.Session(region_name=bedrock_cfg["region"]),
+            model_name=bedrock_cfg["embedding_model"],
+        )
+
     print(f"Using OpenAI embedding model: {config['openai']['embedding_model']}...")
     return embedding_functions.OpenAIEmbeddingFunction(
         api_key=get_openai_api_key(),
@@ -147,6 +160,8 @@ def create_embedding_function(profile: str, config: dict):
 def get_collection_name(profile: str, config: dict) -> str:
     if profile == "local":
         return config["vector_stores"]["local_collection"]
+    if profile == "bedrock":
+        return config["vector_stores"]["bedrock_collection"]
     return config["vector_stores"]["openai_collection"]
 
 
@@ -169,12 +184,17 @@ def prepare_collection(profile: str, config: dict, reset: bool):
     )
 
 
-def rebuild_openai_from_existing(config: dict, reset: bool):
-    """Re-embeds already enriched local documents into the OpenAI collection."""
-    print("Rebuilding OpenAI collection from existing enriched local Chroma documents...")
+def rebuild_from_existing(target_profile: str, config: dict, reset: bool):
+    """Re-embeds already-enriched local documents into another provider's collection.
+
+    The enriched chunk texts (with contextual summaries) already live in the local
+    collection, so building the OpenAI or Bedrock collection is a pure re-embed with
+    the target provider's embedder — no LLM summarization is re-run. Cheap and fast.
+    """
+    print(f"Rebuilding {target_profile.upper()} collection from existing enriched local Chroma documents...")
     chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     source_name = config["vector_stores"]["local_collection"]
-    target = prepare_collection("openai", config, reset)
+    target = prepare_collection(target_profile, config, reset)
 
     source = chroma_client.get_collection(name=source_name)
     total = source.count()
@@ -223,22 +243,24 @@ def rebuild_openai_from_existing(config: dict, reset: bool):
     with open(CATALOG_PATH, "w") as f:
         json.dump(catalog, f, indent=2)
 
-    print(f"\nOpenAI collection rebuilt with {total} chunks.")
+    print(f"\n{target_profile.upper()} collection rebuilt with {total} chunks.")
 
 
 def process_and_ingest(profile: str = "local", reset: bool = False, source: str = "auto"):
     print(f"Starting {profile.upper()} ingestion pipeline...")
     config = load_config()
 
-    if profile not in {"local", "openai"}:
-        raise ValueError("profile must be either 'local' or 'openai'")
+    if profile not in {"local", "openai", "bedrock"}:
+        raise ValueError("profile must be one of 'local', 'openai', 'bedrock'")
 
     if source == "auto":
-        source = "existing" if profile == "openai" else "pdf"
+        source = "existing" if profile in ("openai", "bedrock") else "pdf"
 
-    if profile == "openai" and source == "existing":
-        rebuild_openai_from_existing(config, reset)
+    if profile in ("openai", "bedrock") and source == "existing":
+        rebuild_from_existing(profile, config, reset)
         return
+
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     context_model = load_context_model(profile, config)
     collection = prepare_collection(profile, config, reset)
@@ -264,6 +286,8 @@ def process_and_ingest(profile: str = "local", reset: bool = False, source: str 
             continue
 
         print(f"\nProcessing {metadata['title']}...")
+        from langchain_community.document_loaders import PyPDFLoader
+
         loader = PyPDFLoader(str(pdf_path))
         docs = loader.load()
         chunks = text_splitter.split_documents(docs)
@@ -333,7 +357,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build CiteMentor Chroma and BM25 indices.")
     parser.add_argument(
         "--profile",
-        choices=["local", "openai"],
+        choices=["local", "openai", "bedrock"],
         default="local",
         help="Embedding and contextualization profile to use.",
     )

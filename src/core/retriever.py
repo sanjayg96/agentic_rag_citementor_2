@@ -31,10 +31,14 @@ class HybridRetriever:
         self.genres = {meta.get("genre") for meta in catalog.values() if meta.get("genre")}
         
         # 1. Connect to the collection that matches the active embedding space.
+        #    Each mode has its own collection because the query embedder must match
+        #    the model that built the corpus (Chroma binds the embedder at creation).
         self.chroma_client = chromadb.PersistentClient(path=resolve_chroma_path())
         collection_name = self.config["vector_stores"]["local_collection"]
         if self.inference_mode == "openai":
             collection_name = self.config["vector_stores"]["openai_collection"]
+        elif self.inference_mode == "bedrock":
+            collection_name = self.config["vector_stores"]["bedrock_collection"]
 
         collection_kwargs = {"name": collection_name}
         if self.inference_mode == "local":
@@ -52,6 +56,17 @@ class HybridRetriever:
             self.emb_fn = embedding_functions.OpenAIEmbeddingFunction(
                 api_key=api_key,
                 model_name=self.config["openai"]["embedding_model"]
+            )
+            collection_kwargs["embedding_function"] = self.emb_fn
+        elif self.inference_mode == "bedrock":
+            from chromadb.utils import embedding_functions
+            import boto3
+
+            bedrock_cfg = self.config["bedrock"]
+            session = boto3.Session(region_name=bedrock_cfg["region"])
+            self.emb_fn = embedding_functions.AmazonBedrockEmbeddingFunction(
+                session=session,
+                model_name=bedrock_cfg["embedding_model"],
             )
             collection_kwargs["embedding_function"] = self.emb_fn
 
@@ -249,7 +264,9 @@ class HybridRetriever:
             }
             return results
 
-        if self.inference_mode == "openai":
+        # Both remote modes (openai, bedrock) run in the slim image without the
+        # sentence-transformers cross-encoder, so they return the fused order as-is.
+        if self.inference_mode in ("openai", "bedrock"):
             for item in fused_results:
                 item["cross_score"] = 0.0
             self.last_timings = {

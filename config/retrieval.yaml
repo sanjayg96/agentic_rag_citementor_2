@@ -1,7 +1,11 @@
 system:
-  # Toggle this between "openai" and "local" to switch inference engines instantly
+  # Toggle between "openai", "local", and "bedrock" to switch inference engines.
+  # "bedrock" runs the whole pipeline on AWS Bedrock with ZERO OpenAI dependency
+  # (useful when the OpenAI balance is exhausted). Switching to bedrock requires a
+  # rebuild+redeploy so the image ships this config; see docs/DEPLOYMENT.md.
   inference_mode: "openai"
-  # inference_mode: "local" 
+  # inference_mode: "local"
+  # inference_mode: "bedrock"
   local_llm: "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
   embedding_model: "nomic-ai/nomic-embed-text-v1.5"
   reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -9,6 +13,7 @@ system:
 vector_stores:
   local_collection: "citementor_library"
   openai_collection: "citementor_library_openai"
+  bedrock_collection: "citementor_library_bedrock"
 
 openai:
   # Fast API-only path for demos and Streamlit deployment.
@@ -22,6 +27,16 @@ openai:
   ingestion_summary_batch_size: 20
   embedding_model: "text-embedding-3-small"
   eval_model: "gpt-5-mini"
+
+bedrock:
+  # AWS Bedrock path — no upfront cost, billed on the monthly AWS invoice. On Lambda
+  # the exec role's IAM grants InvokeModel on exactly these model ARNs; credentials
+  # come from the default AWS chain (no API key). Claude 3 Haiku is on-demand (no
+  # inference profile). Titan V2 re-embeds the corpus into `bedrock_collection`.
+  region: "ap-south-1"
+  router_model: "anthropic.claude-3-haiku-20240307-v1:0"
+  synthesis_model: "anthropic.claude-3-haiku-20240307-v1:0"
+  embedding_model: "amazon.titan-embed-text-v2:0"
 
 retrieval:
   max_expanded_queries: 2

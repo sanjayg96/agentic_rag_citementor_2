@@ -48,6 +48,18 @@ def get_openai_llm(model_name: str):
 
     return ChatOpenAI(model=model_name, temperature=0)
 
+@lru_cache(maxsize=None)
+def get_bedrock_llm(model_name: str):
+    """AWS Bedrock chat model via the Converse API. Credentials come from the
+    default AWS chain (Lambda exec role in prod); region from config."""
+    from langchain_aws import ChatBedrockConverse
+
+    return ChatBedrockConverse(
+        model=model_name,
+        temperature=0,
+        region_name=config["bedrock"]["region"],
+    )
+
 class RouteExpansionResult(BaseModel):
     route: str = Field(description="One of finance, relationships, philosophy, out_of_scope, greeting.")
     expanded_queries: list[str] = Field(description="Two to three concise retrieval queries, including the original user intent.")
@@ -57,6 +69,25 @@ def local_generate(prompt: str, max_tokens: int) -> str:
 
     model, tokenizer = get_local_llm()
     return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
+
+def _content_to_text(content) -> str:
+    """Normalise a LangChain message chunk's ``content`` to plain text.
+
+    OpenAI streams string deltas, but ChatBedrockConverse may stream a list of
+    content blocks (e.g. ``[{"type": "text", "text": "..."}]``). This coerces both
+    shapes to a string so the synthesis loop can treat every provider the same.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return ""
 
 def _extract_json_object(text: str) -> dict:
     try:
@@ -114,6 +145,16 @@ def _stream_synthesis_tokens(state: "AgentState"):
         llm = get_openai_llm(config["openai"]["synthesis_model"])
         for chunk in llm.stream(formatted_prompt):
             text = chunk.content
+            if text:
+                yield text
+        return
+
+    if config["system"]["inference_mode"] == "bedrock":
+        llm = get_bedrock_llm(config["bedrock"]["synthesis_model"])
+        for chunk in llm.stream(formatted_prompt):
+            # ChatBedrockConverse chunks may carry content as a string or as a
+            # list of content blocks; normalise to plain text either way.
+            text = _content_to_text(chunk.content)
             if text:
                 yield text
         return
@@ -182,6 +223,15 @@ def router_node(state: AgentState):
             RouteExpansionResult,
             method="json_schema",
             strict=True,
+        )
+        parsed = llm.invoke(route_prompt)
+        route = parsed.route.strip().lower()
+        expanded_raw = parsed.expanded_queries
+    elif config["system"]["inference_mode"] == "bedrock":
+        # Bedrock uses the default (tool-based) structured-output method — the
+        # OpenAI-only json_schema/strict kwargs don't apply.
+        llm = get_bedrock_llm(config["bedrock"]["router_model"]).with_structured_output(
+            RouteExpansionResult,
         )
         parsed = llm.invoke(route_prompt)
         route = parsed.route.strip().lower()
