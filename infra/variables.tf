@@ -38,6 +38,15 @@ variable "image_tag" {
   default     = "latest"
 }
 
+variable "bedrock_model_ids" {
+  description = "Bedrock foundation models the Lambda may invoke (used only when inference_mode=bedrock). Chat: Claude 3 Haiku; embeddings: Titan V2. The exec role is scoped to exactly these model ARNs. Edit here if you change models in config/retrieval.yaml."
+  type        = list(string)
+  default = [
+    "anthropic.claude-3-haiku-20240307-v1:0",
+    "amazon.titan-embed-text-v2:0",
+  ]
+}
+
 # The OpenAI key is intentionally NOT a Terraform variable that gets written
 # into a resource — that would persist plaintext in the local state file. Instead
 # the secret VALUE is pushed by a null_resource whose shell command reads the key

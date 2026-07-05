@@ -39,3 +39,29 @@ resource "aws_iam_role_policy" "read_openai_secret" {
   role   = aws_iam_role.lambda.id
   policy = data.aws_iam_policy_document.read_openai_secret.json
 }
+
+# Least-privilege inline policy for the Bedrock inference mode: allow InvokeModel
+# on ONLY the specific foundation-model ARNs (region-scoped, AWS-owned so no
+# account id). Harmless when inference_mode=openai (nothing calls Bedrock), so it
+# is always attached. Model ACCESS must also be enabled once in the Bedrock
+# console — IAM permission alone is not sufficient.
+data "aws_iam_policy_document" "invoke_bedrock" {
+  statement {
+    sid    = "InvokeBedrockModels"
+    effect = "Allow"
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]
+    resources = [
+      for model_id in var.bedrock_model_ids :
+      "arn:aws:bedrock:${var.region}::foundation-model/${model_id}"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "invoke_bedrock" {
+  name   = "${var.project_name}-invoke-bedrock"
+  role   = aws_iam_role.lambda.id
+  policy = data.aws_iam_policy_document.invoke_bedrock.json
+}
