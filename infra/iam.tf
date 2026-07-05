@@ -40,11 +40,12 @@ resource "aws_iam_role_policy" "read_openai_secret" {
   policy = data.aws_iam_policy_document.read_openai_secret.json
 }
 
-# Least-privilege inline policy for the Bedrock inference mode: allow InvokeModel
-# on ONLY the specific foundation-model ARNs (region-scoped, AWS-owned so no
-# account id). Harmless when inference_mode=openai (nothing calls Bedrock), so it
-# is always attached. Model ACCESS must also be enabled once in the Bedrock
-# console — IAM permission alone is not sufficient.
+# Least-privilege inline policy for the Bedrock inference mode. Allows InvokeModel
+# on exactly: the Titan embedding model (on-demand, region-local), the Nova
+# inference-profile ARNs, and the Nova underlying foundation models (region
+# wildcard, since a cross-region profile may route to any of its APAC regions —
+# still scoped to the specific model). Harmless when inference_mode=openai
+# (nothing calls Bedrock), so it is always attached.
 data "aws_iam_policy_document" "invoke_bedrock" {
   statement {
     sid    = "InvokeBedrockModels"
@@ -53,10 +54,16 @@ data "aws_iam_policy_document" "invoke_bedrock" {
       "bedrock:InvokeModel",
       "bedrock:InvokeModelWithResponseStream",
     ]
-    resources = [
-      for model_id in var.bedrock_model_ids :
-      "arn:aws:bedrock:${var.region}::foundation-model/${model_id}"
-    ]
+    resources = concat(
+      # Titan embeddings (on-demand, this region only)
+      ["arn:aws:bedrock:${var.region}::foundation-model/${var.bedrock_embedding_model_id}"],
+      # Nova inference profiles (account-scoped, this region)
+      [for profile_id, _ in var.bedrock_inference_profiles :
+      "arn:aws:bedrock:${var.region}:${local.account_id}:inference-profile/${profile_id}"],
+      # Nova underlying foundation models (any region the profile routes to)
+      [for _, model_id in var.bedrock_inference_profiles :
+      "arn:aws:bedrock:*::foundation-model/${model_id}"],
+    )
   }
 }
 

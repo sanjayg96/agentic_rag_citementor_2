@@ -38,13 +38,24 @@ variable "image_tag" {
   default     = "latest"
 }
 
-variable "bedrock_model_ids" {
-  description = "Bedrock foundation models the Lambda may invoke (used only when inference_mode=bedrock). Chat: Claude 3 Haiku; embeddings: Titan V2. The exec role is scoped to exactly these model ARNs. Edit here if you change models in config/retrieval.yaml."
-  type        = list(string)
-  default = [
-    "anthropic.claude-3-haiku-20240307-v1:0",
-    "amazon.titan-embed-text-v2:0",
-  ]
+# Bedrock access (used only when inference_mode=bedrock). Chat models are Amazon
+# Nova via cross-region "apac." INFERENCE PROFILES (first-party — no Marketplace
+# subscription, unlike Anthropic). Embeddings are Titan V2 (on-demand). The exec
+# role is scoped to exactly these; edit here if you change models in
+# config/retrieval.yaml.
+variable "bedrock_embedding_model_id" {
+  description = "On-demand Bedrock embedding model (region-local ARN)."
+  type        = string
+  default     = "amazon.titan-embed-text-v2:0"
+}
+
+variable "bedrock_inference_profiles" {
+  description = "Map of inference-profile id (the model id used in config) -> underlying foundation-model id. IAM must allow both the profile ARN and the underlying model ARNs (any region the profile routes to)."
+  type        = map(string)
+  default = {
+    "apac.amazon.nova-lite-v1:0" = "amazon.nova-lite-v1:0" # router
+    "apac.amazon.nova-pro-v1:0"  = "amazon.nova-pro-v1:0"  # synthesis
+  }
 }
 
 # The OpenAI key is intentionally NOT a Terraform variable that gets written
