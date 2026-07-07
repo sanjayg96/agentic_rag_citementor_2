@@ -1,0 +1,71 @@
+name: Deploy (terraform apply)
+
+# Manual trigger only — click "Run workflow" in the Actions tab and pick the mode.
+# This brings the whole AWS stack up on demand.
+on:
+  workflow_dispatch:
+    inputs:
+      inference_mode:
+        description: "Inference engine to deploy"
+        type: choice
+        options:
+          - bedrock   # Amazon Nova + Titan — no OpenAI needed
+          - openai    # OpenAI models (requires a funded OPENAI_API_KEY secret)
+        default: bedrock
+
+# OIDC: the job mints a short-lived token GitHub exchanges for AWS creds.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency: citementor-stack   # never let deploy and teardown race on the state
+
+jobs:
+  deploy:
+    # Native ARM64 runner (free on public repos) → builds the arm64 image without QEMU.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Select inference mode (${{ inputs.inference_mode }})
+        run: |
+          python3 - "${{ inputs.inference_mode }}" <<'PY'
+          import re, sys, pathlib
+          mode = sys.argv[1]
+          p = pathlib.Path("config/retrieval.yaml"); t = p.read_text()
+          t = re.sub(r'^(  inference_mode: )"[^"]*"', r'\1"%s"' % mode, t, count=1, flags=re.M)
+          p.write_text(t)
+          print("inference_mode ->", mode)
+          PY
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.6"
+          terraform_wrapper: false   # so `terraform output -raw` returns clean values
+
+      - name: Terraform apply
+        working-directory: infra
+        env:
+          # Consumed only by the secret-provisioning null_resource. Unused at runtime
+          # in bedrock mode (the value is never read), but the secret must exist.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Publish Function URL
+        working-directory: infra
+        run: |
+          echo "### CiteMentor deployed (${{ inputs.inference_mode }} mode) :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Function URL: $(terraform output -raw function_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Demo (AWS_IAM signed):  scripts/demo_query.sh --warm  then  scripts/demo_query.sh \"<question>\"" >> "$GITHUB_STEP_SUMMARY"

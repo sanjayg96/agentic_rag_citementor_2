@@ -1,0 +1,40 @@
+name: Teardown (terraform destroy)
+
+# Manual trigger only — tears the whole stack down so AWS spend returns to ~$0.
+# The S3 state bucket + OIDC role (created by bootstrap.sh) intentionally survive.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency: citementor-stack   # never let teardown and deploy race on the state
+
+jobs:
+  destroy:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.6"
+          terraform_wrapper: false
+
+      - name: Terraform destroy
+        working-directory: infra
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   # for config eval; unused on destroy
+        run: |
+          terraform init -input=false
+          terraform destroy -auto-approve -input=false
+
+      - name: Confirm
+        run: echo "### CiteMentor stack destroyed — AWS spend back to ~\$0 :white_check_mark:" >> "$GITHUB_STEP_SUMMARY"
