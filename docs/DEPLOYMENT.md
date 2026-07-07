@@ -480,6 +480,65 @@ OpenAI key, proving zero OpenAI dependency.
 `aws configure` profile; on Lambda it's the execution role. This is *why* it's the perfect
 "OpenAI ran out" escape hatch — nothing to fund, nothing to inject.
 
+### Phase 6 — CI/CD: deploy & tear down from the GitHub Actions tab
+
+**Goal.** Turn the whole apply/destroy lifecycle into two buttons in the **Actions** tab —
+so a demo is: click **Deploy** (pick `bedrock`/`openai`), wait, demo, click **Teardown** →
+back to \$0 — with **no long-lived AWS keys** anywhere.
+
+**The pieces:**
+- **GitHub OIDC, not access keys.** Each workflow run mints a short-lived OIDC token; AWS
+  trusts GitHub's OIDC provider and lets the run assume an IAM role for ~an hour. Nothing
+  secret is stored in GitHub except the (unused-in-bedrock) OpenAI key. The role
+  (`citementor-github-actions`) is trusted **only** by this repo's `aws-deploy` branch
+  (`sub = repo:<owner>/<repo>:ref:refs/heads/aws-deploy`) and carries a **scoped** policy —
+  exactly the ECR/Lambda/IAM/Secrets/Logs/S3 actions Terraform touches.
+- **Remote state in S3.** The Deploy run and a later Teardown run are separate ephemeral
+  machines, so state can't be local — it lives in an S3 bucket with **native S3 locking**
+  (`use_lockfile`, no DynamoDB). See `infra/backend.tf`.
+- **Native ARM runners.** The repo is public, so `runs-on: ubuntu-24.04-arm` is free — the
+  arm64 image builds natively (no slow QEMU emulation).
+- **Mode picked at click-time.** `deploy.yml` has a `workflow_dispatch` **choice input**
+  (`inference_mode`); a step rewrites `config/retrieval.yaml` in the checkout before build,
+  so no commit/push is needed to switch engines. (The build hash covers the config, so a
+  different mode triggers a fresh image automatically.)
+
+**One-time bootstrap (`infra/bootstrap.sh`).** The state bucket, OIDC provider, and CI role
+must exist *before* Terraform can run in CI (chicken-and-egg), so they're created once,
+outside the main Terraform, by an idempotent script. They're cheap standing resources (the
+S3 state bucket ≈ \$0/mo; OIDC + IAM are free) that **intentionally survive teardown** — the
+state must outlive the app.
+
+**What the automation did — and the exact manual equivalent (for learning):**
+
+| Step | What the script/CLI did | If you did it by hand |
+|---|---|---|
+| State bucket | `aws s3api create-bucket` + versioning + AES256 + block-public-access | S3 console → Create bucket → enable Versioning, Default encryption, Block all public access |
+| OIDC provider | `aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com` | IAM console → Identity providers → Add provider → OpenID Connect → that URL, audience `sts.amazonaws.com` |
+| CI role | `aws iam create-role` with a trust policy scoped to `repo:…:ref:refs/heads/aws-deploy`, `+ put-role-policy` (scoped perms) | IAM → Roles → Create role → Web identity → GitHub provider → add the repo/branch condition → attach the policy |
+| State migration | `terraform init -migrate-state` (moves the empty local state into S3) | same command locally after adding `backend.tf` |
+| Repo config | `gh variable set AWS_ROLE_ARN/AWS_REGION` and `gh secret set OPENAI_API_KEY` | Repo → Settings → Secrets and variables → Actions → add the two **Variables** and the one **Secret** |
+| Default branch | `gh api -X PATCH … -f default_branch=aws-deploy` | Repo → Settings → General → Default branch → switch to `aws-deploy` |
+
+**Why `aws-deploy` had to become the default branch.** GitHub only lets you *dispatch* a
+`workflow_dispatch` workflow that exists on the **default** branch. The workflows (and all of
+`infra/`) live on `aws-deploy`, so it became the default. It's reversible and doesn't affect
+the Streamlit deploy (Streamlit Cloud is pinned to its own configured branch).
+
+**Three gotchas hit while wiring it up (all now handled):**
+1. **"workflow not found on the default branch"** — the default-branch rule above.
+2. **`CreateLogGroup` 409 (ResourceAlreadyExists)** — Lambda can recreate its
+   `/aws/lambda/<fn>` log group from *late-arriving log events after a destroy*, leaving a
+   "zombie" not in Terraform state. `deploy.yml` deletes any orphan log group before apply.
+3. **`AccessDenied` on `logs:ListTagsForResource`** — the AWS provider reads a log group's
+   tags on the ARN **without** the `:*` suffix; the scoped CI policy needed that action and
+   *both* ARN forms. *Lesson: scoping IAM to exact ARNs is real least-privilege but you
+   discover the provider's precise action/ARN calls by iterating.*
+
+**Verified live:** Deploy workflow (bedrock) → 1m10s → live Function URL → `demo_query.sh`
+returned a grounded answer via Nova → Teardown workflow → app resources gone, shared S3 state
+back to 0 resources, standing bucket + OIDC role intact.
+
 ---
 
 ## 7. Code walkthrough — how the app is wired
@@ -582,8 +641,21 @@ function. Correctness over convenience.
 
 ## 9. Operations runbook
 
+### Preferred: from GitHub Actions (Phase 6)
+
+No laptop, Docker, or AWS keys needed:
+1. **Actions → Deploy → Run workflow** → choose `bedrock` or `openai`. The run assumes the
+   AWS role via OIDC, builds the image on an ARM runner, `terraform apply`s, and prints the
+   Function URL in its summary.
+2. Demo (warm first): `scripts/demo_query.sh --warm` then `scripts/demo_query.sh "<question>"`.
+3. **Actions → Teardown → Run workflow** → `terraform destroy` → **\$0**.
+
+*(First-time-only setup was `infra/bootstrap.sh` + a few `gh` commands — see §6.)*
+
+### Alternative: locally
+
 **Prerequisites:** Terraform ≥ 1.6, Docker running (with buildx), AWS CLI configured,
-and the OpenAI key exported in the shell.
+and the OpenAI key exported in the shell. (Local runs use the same S3 remote state as CI.)
 
 ```bash
 # 0. Provide the OpenAI key to the environment (never stored in state)
@@ -718,16 +790,22 @@ The interview-ready highlight reel:
   versioned, reviewable, and reproducible.
 - **`null_resource` / `local-exec`:** Terraform escape hatch to run a local shell command
   as part of apply (used here to build/push the image and push the secret value).
+- **OIDC (OpenID Connect) for CI:** GitHub Actions presents a short-lived signed token that
+  AWS trusts (via an IAM identity provider) to grant temporary role credentials — so no
+  long-lived AWS access keys are stored in GitHub.
+- **Remote state backend:** Terraform state kept in shared storage (here an S3 bucket with
+  native locking) instead of on one machine, so separate CI runs (and your laptop) operate
+  on one authoritative state.
+- **`workflow_dispatch`:** a GitHub Actions trigger that adds a manual "Run workflow" button
+  (with optional typed inputs, e.g. our `inference_mode` dropdown). Only dispatchable from
+  the repo's default branch.
 
 ---
 
-## 14. What's next (Phases 6–9)
+## 14. What's next (Phases 7–9)
 
 This document grows with the project. Planned additions:
 
-- **Phase 6 — CI/CD (GitHub Actions).** Build/push the ARM64 image and update the Lambda
-  on push to `aws-deploy`, using **OIDC** (short-lived role assumption) instead of
-  long-lived keys. x86 runners build ARM via buildx/QEMU; verify the arch matches.
 - **Phase 7 — Observability + guardrails on cost.** Langfuse tracing in the service;
   CloudWatch alarms (error rate, p95 latency); an AWS Budget (~\$5/mo) alert.
 - **Phase 8 — Streamlit integration.** An env toggle so the Streamlit app can call the
@@ -736,24 +814,20 @@ This document grows with the project. Planned additions:
   replace `AdministratorAccess`; complete the architecture/runbook/cost/observability
   reference.
 
-### The intended demo flow (Phases 6 + 8) — run everything from GitHub
+### The demo flow — run everything from GitHub (Phase 6 ✅, Phase 8 pending)
 
-Once CI/CD (Phase 6) and the Streamlit integration (Phase 8) land, giving a demo becomes:
+CI/CD is live, so giving a demo is already down to:
 
-1. GitHub → **Actions** → run a **"Deploy"** workflow (manual `workflow_dispatch`) → it runs
-   `terraform apply` → the stack comes up.
-2. Warm up, then give the demo on **Streamlit** (the Streamlit app calls the deployed API).
-3. Run a **"Teardown"** workflow → `terraform destroy` → cost back to **\$0**.
+1. GitHub → **Actions** → **Deploy** → *Run workflow* → pick `bedrock` or `openai` → it
+   assumes the AWS role via OIDC and runs `terraform apply` (the run summary prints the
+   Function URL).
+2. Warm up and demo. **Today** that's `scripts/demo_query.sh` (SigV4-signed). **After
+   Phase 8** it'll be the Streamlit app calling the deployed API.
+3. GitHub → **Actions** → **Teardown** → *Run workflow* → `terraform destroy` → **\$0**.
 
-**Two design implications this forces (they refine earlier decisions):**
-- **Terraform state must move to a remote backend (S3 + a DynamoDB lock table).** Today
-  state is local and gitignored. Two *separate* CI runs — apply now, destroy later — are
-  ephemeral and cannot share local state, so the apply/destroy-by-workflow model requires
-  remote state. Auth from GitHub via **OIDC** (a short-lived assumed role), never
-  long-lived keys.
-- **Streamlit → Function URL auth.** The URL is `AWS_IAM`, so the Streamlit app must
-  SigV4-sign its requests using AWS credentials stored as Streamlit secrets (or we add a
-  separate public-auth front door). A Phase 8 detail, but it's why the endpoint isn't just
-  a plain public URL.
+**Still to wire for Phase 8 — Streamlit → Function URL auth.** The URL is `AWS_IAM`, so the
+Streamlit app must SigV4-sign its requests using AWS credentials stored as Streamlit secrets
+(or we add a separate public-auth front door). It's why the endpoint isn't just a plain
+public URL.
 
-> _Last updated: 2026-07-05 — covers Phases 0–5 + the Bedrock inference mode._
+> _Last updated: 2026-07-07 — covers Phases 0–6 + the Bedrock inference mode._

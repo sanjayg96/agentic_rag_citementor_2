@@ -52,10 +52,16 @@ Removes the Lambda, Function URL, ECR repo (incl. images, via `force_delete`),
 secret (immediate, `recovery_window_in_days = 0`), role, and log group. Verify
 with `aws lambda get-function --function-name citementor-api` → not found.
 
+## CI/CD
+
+Preferred path is the **Actions** tab — **Deploy** / **Teardown** workflows (GitHub
+OIDC, no keys). One-time setup lives in [`bootstrap.sh`](bootstrap.sh) (state bucket +
+OIDC provider + scoped role). See [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) §6.
+
 ## Notes
 
-- **State is local and gitignored** (`*.tfstate*`). Solo project; a team would
-  use an S3 + DynamoDB backend.
+- **State is remote** in S3 with native locking (`backend.tf`) so CI and local share it.
+  Created once by `bootstrap.sh`; the bucket survives `destroy` (state must outlive the app).
 - **Corpus changes** under `storage/` don't auto-trigger an image rebuild (the
   build hash covers code/config only). To ship a new corpus:
   `terraform taint null_resource.image_build_push && terraform apply`.

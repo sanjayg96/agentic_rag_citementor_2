@@ -81,7 +81,7 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 - [x] **Phase 3** — ECR + Lambda (container, ARM64) + **Lambda Function URL** (was API Gateway), end-to-end live
 - [x] **Phase 4** — Secrets Manager for `OPENAI_API_KEY`, least-priv read at cold start
 - [x] **Phase 5** — Terraform for the whole stack; verify destroy/apply lifecycle
-- [ ] **Phase 6** — GitHub Actions CI/CD (OIDC, ARM64 buildx)
+- [x] **Phase 6** — GitHub Actions CI/CD (OIDC, native ARM64 runners, S3 remote state)
 - [ ] **Phase 7** — Langfuse tracing + CloudWatch alarms + Budget alert
 - [ ] **Phase 8** — Streamlit optionally calls the deployed API (env-driven), graceful degradation
 - [ ] **Phase 9** — `DEPLOYMENT.md` (architecture, deploy/teardown, cost, secrets, observability)
@@ -255,6 +255,27 @@ New `service/` dir importing the existing core unchanged:
   faster than openai**), repeat → `cache_hit` sim 1.0 → destroy (11 res) → **$0**. Whole run used
   an invalid OpenAI key (proves zero OpenAI use). Default `inference_mode` stays `openai`; switch
   to bedrock = edit config + `terraform apply` (rebuilds). **Next:** Phase 6 (GitHub Actions CI/CD).
+
+- **2026-07-07** — **Phase 6 done (CI/CD live, full lifecycle proven from the Actions tab).**
+  Two `workflow_dispatch` workflows: **deploy.yml** (a `bedrock`/`openai` mode dropdown →
+  OIDC role assume → native **`ubuntu-24.04-arm`** runner builds the arm64 image → `terraform
+  apply` → publishes the Function URL) and **teardown.yml** (`terraform destroy` → $0). Auth is
+  **GitHub OIDC** (no long-lived keys): `infra/bootstrap.sh` (idempotent, one-time) created the
+  IAM OIDC provider, a **scoped** role `citementor-github-actions` trusted only by
+  `repo:sanjayg96/agentic_rag_citementor_2:ref:refs/heads/aws-deploy`, and the **S3 remote-state
+  bucket** `citementor-tfstate-505192030409` (versioned/encrypted/private, **native S3 locking**
+  via `use_lockfile` — no DynamoDB). Migrated local state → S3 (`infra/backend.tf`). Set repo
+  vars `AWS_ROLE_ARN`/`AWS_REGION` + secret `OPENAI_API_KEY` via `gh`. **Made `aws-deploy` the
+  repo default branch** (GitHub only dispatches workflows that live on the default branch;
+  reversible; doesn't affect Streamlit). **Three gotchas fixed live:** (1) workflow-not-found →
+  default-branch rule above; (2) `CreateLogGroup` 409 from a *zombie* Lambda log group (late log
+  events recreate `/aws/lambda/...` after a destroy) → a pre-apply `delete-log-group` step;
+  (3) `AccessDenied` on `logs:ListTagsForResource` → the provider reads log-group tags on the ARN
+  *without* the `:*` suffix, so the scoped policy needed that action + both ARN forms. **Verified:**
+  deploy workflow (bedrock) → live demo returned a grounded answer via Nova → teardown workflow →
+  app resources gone, shared S3 state = 0 resources, standing CI infra (bucket + OIDC role) intact.
+  Cost note: the S3 state bucket is the one standing resource (~$0/mo, a few KB); OIDC/IAM are free.
+  **Next:** Phase 7 (observability + budget alarms).
 
 ## Working notes
 
