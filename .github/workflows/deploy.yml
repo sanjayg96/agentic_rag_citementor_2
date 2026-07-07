@@ -44,6 +44,15 @@ jobs:
           print("inference_mode ->", mode)
           PY
 
+      - name: Remove any orphaned Lambda log group
+        # Lambda can recreate its /aws/lambda/<fn> log group from late-arriving log
+        # events AFTER a prior `terraform destroy`, leaving a "zombie" that isn't in
+        # Terraform state. That makes the next CreateLogGroup 409. Delete it first;
+        # no-op when absent. (Logs are ephemeral demo output — safe to drop.)
+        run: |
+          aws logs delete-log-group --log-group-name /aws/lambda/citementor-api \
+            --region "${{ vars.AWS_REGION }}" 2>/dev/null || true
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: hashicorp/setup-terraform@v3
