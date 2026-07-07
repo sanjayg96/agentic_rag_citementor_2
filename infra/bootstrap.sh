@@ -114,7 +114,8 @@ cat > "${TMP}/perms.json" <<JSON
     { "Sid": "LogsGroup", "Effect": "Allow",
       "Action": ["logs:CreateLogGroup","logs:DeleteLogGroup","logs:PutRetentionPolicy",
                  "logs:TagResource","logs:UntagResource","logs:ListTagsForResource","logs:ListTagsLogGroup"],
-      "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/citementor-api:*" },
+      "Resource": ["arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/citementor-api",
+                   "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/citementor-api:*"] },
     { "Sid": "LogsDescribe", "Effect": "Allow", "Action": ["logs:DescribeLogGroups"], "Resource": "*" }
   ]
 }
