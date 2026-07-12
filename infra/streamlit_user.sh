@@ -45,7 +45,13 @@ fi
 
 # --- 2. Least-privilege inline policy ---------------------------------------
 # GetFunctionUrlConfig: discover the current URL (it changes each deploy).
-# InvokeFunctionUrl: call it, restricted to AWS_IAM-auth URLs on this one function.
+# InvokeFunctionUrl: call it. Scoped to this one function's ARN — that is the whole
+# authorization boundary. We deliberately do NOT add a
+# `lambda:FunctionUrlAuthType == AWS_IAM` condition: the real Function URL invoke
+# request does not reliably populate that condition key, so requiring it caused the
+# invoke to be denied (403) even though discovery was allowed. The condition would be
+# redundant anyway — the URL's auth type is hard-pinned to AWS_IAM in lambda.tf and
+# this account blocks public URLs.
 TMP="$(mktemp -d)"; trap 'rm -rf "${TMP}"' EXIT
 cat > "${TMP}/policy.json" <<JSON
 {
@@ -61,8 +67,7 @@ cat > "${TMP}/policy.json" <<JSON
       "Sid": "InvokeFunctionUrl",
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunctionUrl"],
-      "Resource": "${FUNCTION_ARN}",
-      "Condition": { "StringEquals": { "lambda:FunctionUrlAuthType": "AWS_IAM" } }
+      "Resource": "${FUNCTION_ARN}"
     }
   ]
 }
