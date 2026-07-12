@@ -220,10 +220,15 @@ class CiteMentorRemoteAPI:
         resp = self._signed_request("POST", "query", body)
 
         if resp.status_code == 403:
+            # Surface the real cause: a bad signature and an authorization denial both
+            # return 403 but with distinct bodies / x-amzn-errortype headers.
+            err_type = resp.headers.get("x-amzn-errortype", "")
+            detail = (resp.text or "").strip()[:400]
             raise BackendError(
-                "Request was not authorized (HTTP 403). Check the AWS access key / "
-                "secret in Streamlit secrets and that the IAM user may invoke this "
-                "Function URL."
+                "Request was not authorized (HTTP 403). "
+                f"[{err_type or 'no errortype'}] {detail or '<empty body>'} — "
+                "check the AWS key/secret in Streamlit secrets and that the IAM user "
+                "may invoke this Function URL."
             )
         if resp.status_code >= 500:
             raise BackendError(f"The API returned HTTP {resp.status_code}: {resp.text[:300]}")
