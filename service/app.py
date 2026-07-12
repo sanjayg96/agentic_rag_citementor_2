@@ -12,17 +12,21 @@ process must run with the repository root as its working directory (the Docker
 image sets WORKDIR accordingly).
 """
 
+import os
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
 from mangum import Mangum
 from pydantic import BaseModel, Field
 
-# Populate OPENAI_API_KEY from Secrets Manager (Lambda) before anything reads it.
-# No-op locally where the key is already in the environment (.env).
-from service.secrets import load_openai_key_from_secrets
+# Populate OPENAI_API_KEY and the (optional) Langfuse tracing keys from Secrets
+# Manager (Lambda) before anything reads them. Both are no-ops locally where the
+# values are already in the environment (.env).
+from service.secrets import load_langfuse_keys_from_secrets, load_openai_key_from_secrets
 
 load_openai_key_from_secrets()
+load_langfuse_keys_from_secrets()
 
 # Importing app_graph runs graph.py's module-level setup (loads catalog/config/
 # prompts, calls load_dotenv). The retriever and answer cache stay lazy — they
@@ -53,6 +57,23 @@ class QueryResponse(BaseModel):
     timings: Dict[str, float] = {}
 
 
+@lru_cache(maxsize=1)
+def _get_langfuse_handler():
+    """Built once per cold start; returns None when tracing isn't configured
+    (Phase 7, optional) so the invoke path below stays a no-op without it."""
+    if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
+        return None
+
+    from langfuse.langchain import CallbackHandler
+
+    return CallbackHandler()
+
+
+def _invoke_config() -> Dict[str, Any]:
+    handler = _get_langfuse_handler()
+    return {"callbacks": [handler]} if handler else {}
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     """Cheap liveness probe. Does not initialize the retriever or any model,
@@ -67,7 +88,9 @@ def query(req: QueryRequest) -> QueryResponse:
     Not every graph path populates every state key (e.g. a cache hit or greeting
     skips routing/retrieval), so all fields are read defensively with defaults.
     """
-    final_state: Dict[str, Any] = app_graph.invoke({"query": req.query, "timings": {}})
+    final_state: Dict[str, Any] = app_graph.invoke(
+        {"query": req.query, "timings": {}}, config=_invoke_config()
+    )
     return QueryResponse(
         answer=final_state.get("answer", ""),
         route=final_state.get("route"),

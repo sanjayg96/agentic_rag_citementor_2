@@ -44,3 +44,37 @@ def load_openai_key_from_secrets() -> None:
         key = secret
 
     os.environ["OPENAI_API_KEY"] = key
+
+
+def load_langfuse_keys_from_secrets() -> None:
+    """If no Langfuse keys are set but a secret is configured, fetch and set them.
+
+    Tracing is optional (Phase 7): the secret may hold an empty ``{}`` (pushed by
+    Terraform when LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY weren't exported at
+    apply time), in which case this is a silent no-op and the app runs untraced.
+    Any AWS/parsing failure is treated the same way — tracing must never break
+    the request path.
+    """
+    if os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"):
+        return
+
+    secret_id = os.getenv("LANGFUSE_SECRET_NAME")
+    if not secret_id:
+        return
+
+    import json
+
+    import boto3  # Lazy: only needed on Lambda, where the base image provides it.
+    from botocore.exceptions import ClientError
+
+    try:
+        secret = boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)["SecretString"]
+        data = json.loads(secret)
+    except (ClientError, json.JSONDecodeError):
+        return
+
+    public_key = data.get("public_key")
+    secret_key = data.get("secret_key")
+    if public_key and secret_key:
+        os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
+        os.environ["LANGFUSE_SECRET_KEY"] = secret_key

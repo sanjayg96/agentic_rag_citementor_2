@@ -63,3 +63,23 @@ variable "bedrock_inference_profiles" {
 # the secret VALUE is pushed by a null_resource whose shell command reads the key
 # from the OPENAI_API_KEY environment variable at apply time (see secrets.tf).
 # Terraform only ever manages the empty secret *container*.
+
+# --- Phase 7: observability ---
+
+variable "langfuse_host" {
+  description = "Langfuse Cloud region endpoint (must match the region chosen at signup). Set to https://us.cloud.langfuse.com for the US region."
+  type        = string
+  default     = "https://cloud.langfuse.com"
+}
+
+# Like the OpenAI key, the Langfuse public/secret keys are pushed from the
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars at apply time (see
+# secrets.tf) — never a Terraform variable, never in state. Tracing is
+# optional: if those env vars are unset at apply time, the secret is left
+# empty and the app simply runs untraced.
+
+variable "alert_email" {
+  description = "Email address subscribed to the CloudWatch alarm SNS topic (error rate, p95 latency). AWS sends a confirmation email on first apply that must be clicked before notifications deliver."
+  type        = string
+  default     = "sanjaybg96@gmail.com"
+}

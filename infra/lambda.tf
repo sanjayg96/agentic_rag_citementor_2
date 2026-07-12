@@ -24,6 +24,13 @@ resource "aws_lambda_function" "api" {
       # No plaintext key here — only the name of the secret to fetch at cold start
       # (service/secrets.py reads OPENAI_SECRET_NAME, calls Secrets Manager).
       OPENAI_SECRET_NAME = aws_secretsmanager_secret.openai.name
+
+      # Phase 7: Langfuse tracing. Secret name only (may hold empty '{}' -> the
+      # app runs untraced). LANGFUSE_HOST is not a secret; both env var names are
+      # set because the SDK version in use determines which one it reads.
+      LANGFUSE_SECRET_NAME = aws_secretsmanager_secret.langfuse.name
+      LANGFUSE_HOST        = var.langfuse_host
+      LANGFUSE_BASE_URL    = var.langfuse_host
     }
   }
 

@@ -2,8 +2,9 @@
 
 Infrastructure-as-code for the whole serverless stack: ECR repo + image
 build/push, Lambda (container, ARM64) + Function URL, IAM exec role, Secrets
-Manager secret, CloudWatch log group. One `apply` creates everything from
-nothing; one `destroy` returns AWS spend to ~$0.
+Manager secrets (OpenAI key, optional Langfuse tracing keys), CloudWatch log
+group + alarms (error rate, p95 latency) with an SNS email topic. One `apply`
+creates everything from nothing; one `destroy` returns AWS spend to ~$0.
 
 See the full narrative + theory in [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md).
 
@@ -68,3 +69,8 @@ OIDC provider + scoped role). See [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.m
 - **Secret value** is set by a `null_resource` reading `$OPENAI_API_KEY` at apply
   time; rotating the key needs no Terraform change — just
   `aws secretsmanager put-secret-value`.
+- **Observability (Phase 7).** CloudWatch alarms (`monitoring.tf`) notify `var.alert_email`
+  via SNS — AWS emails a one-time confirmation link on first apply that must be clicked.
+  LLM tracing via Langfuse is optional: export `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`
+  before apply to enable it, or leave unset to run untraced. A standing `$5/mo` AWS Budget
+  alert lives outside this Terraform, in `bootstrap.sh` (survives `destroy` on purpose).

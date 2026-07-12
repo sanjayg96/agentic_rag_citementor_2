@@ -39,3 +39,43 @@ resource "null_resource" "openai_secret_value" {
     EOT
   }
 }
+
+# --- Secrets Manager: Langfuse tracing keys (Phase 7, optional) ---
+#
+# Same pattern as the OpenAI secret above, with one difference: tracing is
+# optional, so a missing LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY does not fail
+# the apply. Instead the secret is left holding an empty JSON object, and
+# service/secrets.py treats that as "tracing disabled" — the app runs
+# untraced rather than erroring.
+
+resource "aws_secretsmanager_secret" "langfuse" {
+  name        = "${var.project_name}/langfuse_keys"
+  description = "Langfuse public/secret API keys for LLM tracing. Read-only by the exec role. Optional — app runs untraced if empty."
+
+  recovery_window_in_days = 0
+}
+
+resource "null_resource" "langfuse_secret_value" {
+  triggers = {
+    secret_id = aws_secretsmanager_secret.langfuse.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      if [ -z "$${LANGFUSE_PUBLIC_KEY:-}" ] || [ -z "$${LANGFUSE_SECRET_KEY:-}" ]; then
+        echo ">> LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY not set - leaving ${aws_secretsmanager_secret.langfuse.name} empty (app runs untraced)." >&2
+        aws secretsmanager put-secret-value --region ${var.region} \
+          --secret-id ${aws_secretsmanager_secret.langfuse.id} \
+          --secret-string '{}' >/dev/null
+        exit 0
+      fi
+      SECRET_JSON=$(python3 -c 'import json,os,sys; json.dump({"public_key": os.environ["LANGFUSE_PUBLIC_KEY"], "secret_key": os.environ["LANGFUSE_SECRET_KEY"]}, sys.stdout)')
+      aws secretsmanager put-secret-value --region ${var.region} \
+        --secret-id ${aws_secretsmanager_secret.langfuse.id} \
+        --secret-string "$${SECRET_JSON}" >/dev/null
+      echo ">> Langfuse keys written to ${aws_secretsmanager_secret.langfuse.name}"
+    EOT
+  }
+}

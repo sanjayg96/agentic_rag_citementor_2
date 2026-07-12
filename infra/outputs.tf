@@ -27,3 +27,13 @@ output "demo_hint" {
   description = "How to run the demo once applied."
   value       = "Warm up:  scripts/demo_query.sh --warm   |   Ask:  scripts/demo_query.sh \"What is virtue?\""
 }
+
+output "langfuse_secret_name" {
+  description = "Secrets Manager secret holding the Langfuse tracing keys (may be an empty '{}' if tracing wasn't configured at apply time)."
+  value       = aws_secretsmanager_secret.langfuse.name
+}
+
+output "alerts_topic_arn" {
+  description = "SNS topic the CloudWatch alarms (error rate, p95 latency) publish to."
+  value       = aws_sns_topic.alerts.arn
+}

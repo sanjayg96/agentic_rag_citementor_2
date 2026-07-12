@@ -29,6 +29,11 @@ openai==2.32.0
 # image). Imported lazily, so it is inert when inference_mode is openai.
 langchain-aws==1.4.6
 
+# LLM tracing (Phase 7, optional). Reads LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY
+# from the environment; if unset the app just runs untraced (service/app.py never
+# constructs the handler in that case).
+langfuse==4.9.1
+
 # --- Support libs ---
 pydantic==2.13.3
 pyyaml==6.0.3

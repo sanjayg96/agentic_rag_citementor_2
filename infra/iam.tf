@@ -72,3 +72,21 @@ resource "aws_iam_role_policy" "invoke_bedrock" {
   role   = aws_iam_role.lambda.id
   policy = data.aws_iam_policy_document.invoke_bedrock.json
 }
+
+# Least-privilege inline policy: read GetSecretValue on ONLY the Langfuse
+# tracing secret (Phase 7). Harmless if the secret holds an empty '{}' (tracing
+# disabled) — service/secrets.py just finds no keys and skips tracing.
+data "aws_iam_policy_document" "read_langfuse_secret" {
+  statement {
+    sid       = "ReadLangfuseKeysOnly"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.langfuse.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "read_langfuse_secret" {
+  name   = "${var.project_name}-read-langfuse-secret"
+  role   = aws_iam_role.lambda.id
+  policy = data.aws_iam_policy_document.read_langfuse_secret.json
+}

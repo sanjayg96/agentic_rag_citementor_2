@@ -8,9 +8,9 @@
 > 2. **Learning guide** — explain *why* each AWS service and each line of config exists, from first principles.
 > 3. **Interview reference** — every decision here is defensible; this is the script for talking through it.
 >
-> It is a living document. It currently covers **Phases 0–5** (extract → containerize →
-> bundle data → deploy → secrets → Terraform). Phases 6–9 (CI/CD, observability,
-> Streamlit integration, hardening) will be appended as they land.
+> It is a living document. It currently covers **Phases 0–7** (extract → containerize →
+> bundle data → deploy → secrets → Terraform → CI/CD → observability + cost guardrails).
+> Phases 8–9 (Streamlit integration, final hardening) will be appended as they land.
 >
 > Companion files: [`aws-deployment.md`](aws-deployment.md) is the terse resumable
 > tracker (checkboxes + session log). [`../infra/README.md`](../infra/README.md) is
@@ -539,6 +539,80 @@ the Streamlit deploy (Streamlit Cloud is pinned to its own configured branch).
 returned a grounded answer via Nova → Teardown workflow → app resources gone, shared S3 state
 back to 0 resources, standing bucket + OIDC role intact.
 
+### Phase 7 — Observability + cost guardrails
+
+**Goal.** Close the two visibility gaps left after Phase 6: no LLM-level tracing beyond
+raw per-node `timings`, and no alerting if the Lambda starts failing, gets slow, or the
+AWS bill spikes while nobody is watching a scale-to-zero demo service.
+
+**1. Langfuse tracing (optional, LangGraph-native).** `service/secrets.py` gained
+`load_langfuse_keys_from_secrets()`, the same shape as the OpenAI-key loader: if
+`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` aren't already in the environment, fetch them
+from a Secrets Manager secret at cold start. `service/app.py` builds a `langfuse.langchain.
+CallbackHandler` once (`lru_cache`) *only* if both keys resolved, and passes it via
+`config={"callbacks": [...]}` to `app_graph.invoke(...)`. No change to `graph.py` at all —
+LangChain/LangGraph propagate callbacks from the top-level `config` down to every nested
+LLM call automatically (the same mechanism LangSmith tracing relies on), so router,
+retriever, and synthesis all show up as spans in one trace with zero extra plumbing.
+
+**Why optional, not mandatory like the OpenAI key.** Tracing is a nice-to-have, not a
+correctness dependency — the app must run identically whether or not Langfuse is
+configured. `infra/secrets.tf`'s `null_resource.langfuse_secret_value` pushes an empty
+`{}` when the env vars aren't exported at apply time (unlike the OpenAI secret's
+provisioner, which hard-fails the apply if the key is missing), and both
+`service/secrets.py` and `service/app.py` treat "no keys" as a silent no-op.
+
+**Why both `LANGFUSE_HOST` and `LANGFUSE_BASE_URL` are set.** The Langfuse Python SDK did
+a major v3→v4 rewrite (v4 shipped March 2026); the host env var name was uncertain across
+that boundary in the docs available at write time. Setting both is free and future-proofs
+against either SDK generation reading it.
+
+**2. CloudWatch alarms (app-level — torn down with the rest).** New `infra/monitoring.tf`:
+an SNS topic (`citementor-alerts`) with an email subscription (`var.alert_email`), an
+`Errors` alarm (`GreaterThanOrEqualToThreshold 1` over 5 minutes — deliberately trigger-
+happy, because this function is invoked rarely enough that *any* error is worth a look,
+not just a statistically significant error rate), and a `Duration` **p95** alarm at 80% of
+`var.lambda_timeout_s` (an early warning before requests actually start timing out, not
+just after). Both use `treat_missing_data = "notBreaching"` since long invocation-free
+stretches are normal for a scale-to-zero demo service and must not falsely alarm.
+Cost: SNS + 2 alarms are a few cents/month while the stack is applied, gone on `destroy` —
+consistent with the project's $0-at-rest design.
+
+**AWS requires clicking a confirmation link** in the first SNS email before notifications
+actually deliver — there's no API to skip this, so it's a one-time manual step after the
+first `apply`.
+
+**3. AWS Budget (standing — outside the app Terraform, in `infra/bootstrap.sh`).** A
+`$5/mo` budget with ACTUAL≥80% and FORECASTED≥100% email notifications, created
+idempotently alongside the state bucket/OIDC provider/CI role (step 4 of the same script).
+**Why it lives in the bootstrap layer and not `infra/*.tf`:** the risk it guards against —
+Bedrock/OpenAI per-query cost, or the Function URL being hammered — exists independent of
+whether the Lambda stack is currently applied or torn down, so the alert must survive
+`terraform destroy` the same way the state bucket and OIDC role do. Budgets notifications
+need no confirmation step (unlike SNS) — AWS just emails directly.
+
+**One CI-permissions consequence.** The new SNS topic and CloudWatch alarms are resources
+the GitHub Actions CI role must be allowed to create/destroy. `infra/bootstrap.sh`'s scoped
+`perms.json` gained `sns:*`/`cloudwatch:*` actions scoped to exactly the new alarm and
+topic ARNs — **anyone with an existing deployment must re-run `bash infra/bootstrap.sh`
+once** (idempotent; just updates the role's inline policy) before the next CI-driven
+deploy, or `terraform apply` will fail with `AccessDenied` creating the SNS topic.
+
+**Verified live end-to-end.** Locally first: ran `uvicorn` with real Langfuse keys in `.env`,
+a `/query` call returned a grounded answer, and the trace (full LangGraph input/output,
+one span per node) appeared in the Langfuse dashboard within seconds. Then for real on AWS:
+`terraform apply` (18 resources — Lambda, both secrets, SNS topic, both alarms, Function
+URL) succeeded; `demo_query.sh --warm` proved the Langfuse secret fetch at cold start
+doesn't break anything; a real query came back grounded; `describe-alarms` showed both
+alarms `OK`; the SNS email subscription registered; and the Langfuse public API
+(`GET /api/public/traces`) confirmed a **new trace with 10 observations** landed right
+after the cloud query — proving the full Lambda → Secrets Manager → Langfuse path, not
+just the local one. Re-ran `bootstrap.sh`: the CI role picked up the new SNS/CloudWatch
+permissions, and the standing AWS Budget (`citementor-monthly`, \$5/mo, ACTUAL≥80% /
+FORECASTED≥100% email alerts) was created and confirmed via `describe-budget`. Then
+`terraform destroy` (18 resources) → confirmed Lambda/ECR/both secrets **not found** →
+spend back to ~\$0 (state bucket, OIDC role, and the Budget intentionally survive).
+
 ---
 
 ## 7. Code walkthrough — how the app is wired
@@ -546,7 +620,7 @@ back to 0 resources, standing bucket + OIDC role intact.
 ```
 service/
   app.py              FastAPI app + Mangum handler (the only HTTP layer)
-  secrets.py          cold-start fetch of OPENAI_API_KEY from Secrets Manager
+  secrets.py          cold-start fetch of OPENAI_API_KEY + (optional) Langfuse keys
   requirements.txt    slim, OpenAI-only, pinned deps
   Dockerfile          ARM64 Lambda image
   .env.example        documents env vars
@@ -579,6 +653,9 @@ infra/                Terraform (see §8)
   `get_secret_value(...)`, accept either a raw string or a `{"OPENAI_API_KEY": ...}`
   JSON blob, and set `os.environ["OPENAI_API_KEY"]`. The lazy import is why boto3
   isn't a dependency locally.
+- `load_langfuse_keys_from_secrets()` (Phase 7) is the same shape but optional: any
+  AWS/parsing failure, or an empty `{}` secret, is a silent no-op — tracing must never
+  break the request path.
 
 **`src/core/storage.py` — the read-only-filesystem fix.**
 - `resolve_chroma_path()` returns the bundled path locally and the `/tmp` copy on
@@ -603,10 +680,11 @@ Files under `infra/` (one concern per file for readability):
 | `variables.tf` | `region`, `project_name`, `lambda_memory_mb` (3008), `lambda_timeout_s` (120), `log_retention_days` (14), `image_tag` (latest). |
 | `locals.tf` | Resource name, repo URL, and `source_hash` (md5 over code/config files → triggers rebuilds). |
 | `ecr.tf` | ECR repo (`force_delete`), `null_resource.image_build_push` (buildx + push), `data.aws_ecr_image` (digest). |
-| `secrets.tf` | Secret container (`recovery_window_in_days = 0`) + `null_resource.openai_secret_value` (push value from env). |
-| `iam.tf` | Exec role + assume policy, `AWSLambdaBasicExecutionRole` attachment, inline read-one-secret policy. |
-| `lambda.tf` | Log group, `aws_lambda_function` (image by digest, arm64, mem/timeout, `OPENAI_SECRET_NAME` env), `aws_lambda_function_url` (`AWS_IAM`). |
-| `outputs.tf` | `function_url`, `function_name`, `ecr_repository_url`, `image_digest`, `secret_name`, `demo_hint`. |
+| `secrets.tf` | OpenAI secret container + `null_resource.openai_secret_value` (mandatory). Langfuse secret container + `null_resource.langfuse_secret_value` (Phase 7, optional — pushes `{}` if unset). Both `recovery_window_in_days = 0`. |
+| `iam.tf` | Exec role + assume policy, `AWSLambdaBasicExecutionRole` attachment, inline read-only policies for the OpenAI secret, the Bedrock models, and the Langfuse secret. |
+| `lambda.tf` | Log group, `aws_lambda_function` (image by digest, arm64, mem/timeout, `OPENAI_SECRET_NAME`/`LANGFUSE_SECRET_NAME`/`LANGFUSE_HOST` env), `aws_lambda_function_url` (`AWS_IAM`). |
+| `monitoring.tf` | Phase 7: `aws_sns_topic` + email subscription, `Errors` alarm, `Duration` p95 alarm — app-level, torn down with the rest. |
+| `outputs.tf` | `function_url`, `function_name`, `ecr_repository_url`, `image_digest`, `secret_name`, `langfuse_secret_name`, `alerts_topic_arn`, `demo_hint`. |
 | `terraform.tfvars.example` | Optional overrides; documents that the key comes from the env, not here. |
 
 **The dependency chain Terraform resolves automatically:**
@@ -802,12 +880,13 @@ The interview-ready highlight reel:
 
 ---
 
-## 14. What's next (Phases 7–9)
+## 14. What's next (Phases 8–9)
 
 This document grows with the project. Planned additions:
 
-- **Phase 7 — Observability + guardrails on cost.** Langfuse tracing in the service;
-  CloudWatch alarms (error rate, p95 latency); an AWS Budget (~\$5/mo) alert.
+- **Phase 7 — Observability + guardrails on cost.** ✅ Done and verified live: Langfuse
+  tracing in the service (optional); CloudWatch alarms (error rate, p95 latency); a
+  standing AWS Budget (~\$5/mo). See §6 for the full verification story.
 - **Phase 8 — Streamlit integration.** An env toggle so the Streamlit app can call the
   deployed API, with graceful degradation when the stack is torn down.
 - **Phase 9 — Final hardening + this doc made exhaustive.** Scoped least-privilege IAM to
@@ -825,9 +904,13 @@ CI/CD is live, so giving a demo is already down to:
    Phase 8** it'll be the Streamlit app calling the deployed API.
 3. GitHub → **Actions** → **Teardown** → *Run workflow* → `terraform destroy` → **\$0**.
 
+**One-time step before the next deploy (Phase 7):** re-run `bash infra/bootstrap.sh` to
+grant the CI role the new SNS/CloudWatch permissions, and optionally add the
+`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` repo secrets if you want traced queries.
+
 **Still to wire for Phase 8 — Streamlit → Function URL auth.** The URL is `AWS_IAM`, so the
 Streamlit app must SigV4-sign its requests using AWS credentials stored as Streamlit secrets
 (or we add a separate public-auth front door). It's why the endpoint isn't just a plain
 public URL.
 
-> _Last updated: 2026-07-07 — covers Phases 0–6 + the Bedrock inference mode._
+> _Last updated: 2026-07-09 — covers Phases 0–7 + the Bedrock inference mode._

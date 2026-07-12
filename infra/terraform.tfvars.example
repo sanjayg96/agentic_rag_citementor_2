@@ -8,8 +8,16 @@
 # lambda_timeout_s  = 120
 # log_retention_days = 14
 # image_tag         = "latest"
+# langfuse_host     = "https://cloud.langfuse.com"   # or https://us.cloud.langfuse.com
+# alert_email       = "you@example.com"              # CloudWatch alarm notifications
 
 # NOTE: the OpenAI API key is NOT set here. Export it in your shell before apply:
 #   export OPENAI_API_KEY=sk-...        (or: set -a; source ../.env; set +a)
 # Terraform reads it from the environment when pushing the secret value, so the
 # key never enters terraform.tfvars or the state file.
+
+# NOTE (Phase 7, optional): Langfuse tracing keys are also read from the
+# environment, not a variable — export before apply if you want tracing:
+#   export LANGFUSE_PUBLIC_KEY=pk-lf-...
+#   export LANGFUSE_SECRET_KEY=sk-lf-...
+# If unset, the Langfuse secret is left empty and the app runs untraced.

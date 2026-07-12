@@ -66,6 +66,11 @@ jobs:
           # Consumed only by the secret-provisioning null_resource. Unused at runtime
           # in bedrock mode (the value is never read), but the secret must exist.
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Optional (Phase 7 tracing). If either repo secret is unset, these are
+          # empty strings and the Langfuse secret is left as an empty '{}' — the
+          # app just runs untraced. See secrets.tf.
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
         run: |
           terraform init -input=false
           terraform apply -auto-approve -input=false

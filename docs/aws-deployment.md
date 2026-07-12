@@ -44,7 +44,7 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 - **Storage to bundle:** `storage/chroma_db/` (~69MB, collection `citementor_library_openai`) +
   `storage/bm25/bm25_index.pkl` (~6MB) + `catalog.json` + `config/retrieval.yaml` +
   `prompts.yaml`. Paths are **relative**, so the container WORKDIR must contain them.
-- **No Langfuse/LangSmith yet** — only DeepEval (UI) + per-node timings. Phase 7 adds Langfuse.
+- **Langfuse tracing added (Phase 7)** — optional, keyed off `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`; falls back to untraced if unset. DeepEval (UI) + per-node timings remain unchanged.
 
 ## Decisions Locked
 
@@ -82,7 +82,7 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 - [x] **Phase 4** — Secrets Manager for `OPENAI_API_KEY`, least-priv read at cold start
 - [x] **Phase 5** — Terraform for the whole stack; verify destroy/apply lifecycle
 - [x] **Phase 6** — GitHub Actions CI/CD (OIDC, native ARM64 runners, S3 remote state)
-- [ ] **Phase 7** — Langfuse tracing + CloudWatch alarms + Budget alert
+- [x] **Phase 7** — Langfuse tracing + CloudWatch alarms + Budget alert
 - [ ] **Phase 8** — Streamlit optionally calls the deployed API (env-driven), graceful degradation
 - [ ] **Phase 9** — `DEPLOYMENT.md` (architecture, deploy/teardown, cost, secrets, observability)
 - [ ] **Post-pass** — scoped least-privilege IAM policy (replace `AdministratorAccess`), documented
@@ -276,6 +276,44 @@ New `service/` dir importing the existing core unchanged:
   app resources gone, shared S3 state = 0 resources, standing CI infra (bucket + OIDC role) intact.
   Cost note: the S3 state bucket is the one standing resource (~$0/mo, a few KB); OIDC/IAM are free.
   **Next:** Phase 7 (observability + budget alarms).
+
+- **2026-07-09** — **Phase 7 done (Langfuse + CloudWatch alarms + Budget), verified live end-to-end.**
+  **Langfuse tracing** (optional): `service/secrets.py::load_langfuse_keys_from_secrets()` mirrors the
+  OpenAI-key pattern (fetch from Secrets Manager at cold start, no-op if already set); `service/app.py`
+  builds a cached `langfuse.langchain.CallbackHandler` only if both keys are present and passes it as
+  `config={"callbacks": [...]}` to `app_graph.invoke(...)` — zero code changes to `graph.py` since
+  LangChain/LangGraph propagate callbacks to nested LLM calls automatically. Both `LANGFUSE_HOST` and
+  `LANGFUSE_BASE_URL` env vars are set (SDK v4 renamed the host var; setting both is cheap insurance).
+  New Secrets Manager secret `citementor/langfuse_keys`: unlike the mandatory OpenAI secret, this one
+  is intentionally optional — `null_resource.langfuse_secret_value` pushes an empty `{}` when
+  `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` aren't exported at apply time, and the app just runs
+  untraced. **CloudWatch alarms** (`infra/monitoring.tf`, app-level — torn down with the rest since
+  they cost a few cents/month while applied): an SNS topic (`citementor-alerts`) with an email
+  subscription (`var.alert_email`, defaults to the account owner's email), an `Errors` alarm (any
+  error in 5 min — this function is rarely invoked, so even one matters) and a `Duration` p95 alarm
+  at 80% of the Lambda timeout (an early warning before requests actually start timing out).
+  **AWS Budget** (`infra/bootstrap.sh`, step 4 — deliberately standing/outside the app Terraform,
+  since cost risk exists whether or not the Lambda stack is currently deployed): `$5/mo` budget with
+  ACTUAL-80%/FORECASTED-100% email notifications, created idempotently alongside the existing state
+  bucket/OIDC/CI-role bootstrap. The CI role's scoped policy (`perms.json`) gained `sns:*`/
+  `cloudwatch:*` actions scoped to the new alarm/topic ARNs — **existing deployments must re-run
+  `bash infra/bootstrap.sh` once** to pick up the updated permissions before the next CI deploy.
+  **Verified live end-to-end.** Signed up for Langfuse Cloud, put the key pair in `.env`. Ran the
+  service locally (uvicorn, `service/requirements.txt` installed into the project venv): `/query`
+  returned a grounded answer, and the trace (full LangGraph input/output, one span per node) showed
+  up in the Langfuse dashboard within seconds. Then a real `terraform apply` from this account
+  (18 resources: Lambda, both secrets, SNS topic, both alarms, Function URL, etc.) — cold start via
+  `demo_query.sh --warm` succeeded (proving the Langfuse secret fetch at cold start didn't break
+  anything), a real query via `demo_query.sh` came back grounded, CloudWatch showed both alarms in
+  `OK` state and the SNS email subscription registered, and the Langfuse public API
+  (`GET /api/public/traces`) confirmed a **new cloud trace** (10 observations) landed right after the
+  query — proving tracing works through the full Lambda → Secrets Manager → Langfuse path, not just
+  locally. Also ran `bash infra/bootstrap.sh` again: updated the CI role's scoped policy with the new
+  `sns:*`/`cloudwatch:*` actions, and created the standing AWS Budget (`citementor-monthly`, $5/mo,
+  ACTUAL≥80%/FORECASTED≥100% email alerts) — confirmed via `aws budgets describe-budget` /
+  `describe-notifications-for-budget`. Then `terraform destroy` (18 resources) and confirmed Lambda/
+  ECR/both secrets **not found** — spend back to ~$0; the state bucket, OIDC role, and the new Budget
+  intentionally survive. **Next:** Phase 8 (Streamlit → deployed API).
 
 ## Working notes
 

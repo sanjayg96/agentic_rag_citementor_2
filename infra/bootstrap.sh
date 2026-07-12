@@ -8,10 +8,15 @@
 #   2. A GitHub OIDC identity provider in IAM, so GitHub Actions can get short-lived
 #      AWS credentials by exchanging its OIDC token — NO long-lived access keys.
 #   3. A scoped IAM role the workflows assume (trusted ONLY by this repo).
+#   4. (Phase 7) An AWS Budget with an email alert — deliberately OUTSIDE the app
+#      Terraform, because the cost-runaway risk it guards against (Bedrock/OpenAI/
+#      Lambda usage) exists independent of whether the app stack is currently
+#      applied or torn down.
 #
 # These are cheap, standing resources (the S3 state bucket is a few KB → ~$0/mo;
-# IAM/OIDC are free). They intentionally survive `terraform destroy` — the state
-# must outlive the app. Re-running this script is safe (idempotent).
+# IAM/OIDC/Budgets are free). They intentionally survive `terraform destroy` — the
+# state (and the budget alert) must outlive the app. Re-running this script is
+# safe (idempotent).
 #
 # Run once, locally, as an admin (the citementor-deploy user):  bash infra/bootstrap.sh
 set -euo pipefail
@@ -26,14 +31,17 @@ STATE_BUCKET="citementor-tfstate-${ACCOUNT_ID}"
 ROLE_NAME="citementor-github-actions"
 OIDC_HOST="token.actions.githubusercontent.com"
 OIDC_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_HOST}"
+BUDGET_NAME="citementor-monthly"
+BUDGET_LIMIT_USD="5"
+ALERT_EMAIL="sanjaybg96@gmail.com"   # edit if you want budget alerts elsewhere
 
 echo ">> Account ${ACCOUNT_ID} | region ${REGION} | repo ${GH_OWNER}/${GH_REPO}"
 
 # --- 1. S3 state bucket ------------------------------------------------------
 if aws s3api head-bucket --bucket "${STATE_BUCKET}" 2>/dev/null; then
-  echo ">> [1/3] State bucket ${STATE_BUCKET} already exists."
+  echo ">> [1/4] State bucket ${STATE_BUCKET} already exists."
 else
-  echo ">> [1/3] Creating state bucket ${STATE_BUCKET}..."
+  echo ">> [1/4] Creating state bucket ${STATE_BUCKET}..."
   aws s3api create-bucket --bucket "${STATE_BUCKET}" --region "${REGION}" \
     --create-bucket-configuration "LocationConstraint=${REGION}" >/dev/null
 fi
@@ -50,9 +58,9 @@ echo "   bucket ready (versioned + encrypted + private)."
 
 # --- 2. GitHub OIDC provider -------------------------------------------------
 if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "${OIDC_ARN}" >/dev/null 2>&1; then
-  echo ">> [2/3] OIDC provider already exists."
+  echo ">> [2/4] OIDC provider already exists."
 else
-  echo ">> [2/3] Creating GitHub OIDC provider..."
+  echo ">> [2/4] Creating GitHub OIDC provider..."
   # Thumbprints are no longer security-critical for GitHub (AWS validates against a
   # trusted CA library) but the API still requires the field; these are GitHub's.
   aws iam create-open-id-connect-provider \
@@ -116,17 +124,27 @@ cat > "${TMP}/perms.json" <<JSON
                  "logs:TagResource","logs:UntagResource","logs:ListTagsForResource","logs:ListTagsLogGroup"],
       "Resource": ["arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/citementor-api",
                    "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/citementor-api:*"] },
-    { "Sid": "LogsDescribe", "Effect": "Allow", "Action": ["logs:DescribeLogGroups"], "Resource": "*" }
+    { "Sid": "LogsDescribe", "Effect": "Allow", "Action": ["logs:DescribeLogGroups"], "Resource": "*" },
+    { "Sid": "Sns", "Effect": "Allow",
+      "Action": ["sns:CreateTopic","sns:DeleteTopic","sns:GetTopicAttributes","sns:SetTopicAttributes",
+                 "sns:TagResource","sns:UntagResource","sns:ListTagsForResource",
+                 "sns:Subscribe","sns:Unsubscribe","sns:ListSubscriptionsByTopic"],
+      "Resource": "arn:aws:sns:${REGION}:${ACCOUNT_ID}:citementor-alerts" },
+    { "Sid": "CloudwatchAlarms", "Effect": "Allow",
+      "Action": ["cloudwatch:PutMetricAlarm","cloudwatch:DeleteAlarms","cloudwatch:DescribeAlarms",
+                 "cloudwatch:TagResource","cloudwatch:UntagResource","cloudwatch:ListTagsForResource"],
+      "Resource": ["arn:aws:cloudwatch:${REGION}:${ACCOUNT_ID}:alarm:citementor-api-errors",
+                   "arn:aws:cloudwatch:${REGION}:${ACCOUNT_ID}:alarm:citementor-api-latency-p95"] }
   ]
 }
 JSON
 
 if aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1; then
-  echo ">> [3/3] Role ${ROLE_NAME} exists — updating trust + permissions..."
+  echo ">> [3/4] Role ${ROLE_NAME} exists — updating trust + permissions..."
   aws iam update-assume-role-policy --role-name "${ROLE_NAME}" \
     --policy-document "file://${TMP}/trust.json" >/dev/null
 else
-  echo ">> [3/3] Creating role ${ROLE_NAME}..."
+  echo ">> [3/4] Creating role ${ROLE_NAME}..."
   aws iam create-role --role-name "${ROLE_NAME}" \
     --assume-role-policy-document "file://${TMP}/trust.json" \
     --description "GitHub Actions OIDC role for the citementor CI/CD workflows" >/dev/null
@@ -135,12 +153,47 @@ aws iam put-role-policy --role-name "${ROLE_NAME}" \
   --policy-name "citementor-cicd" \
   --policy-document "file://${TMP}/perms.json"
 
+# --- 4. AWS Budget with an email alert (Phase 7, standing) --------------------
+# Deliberately NOT in the app Terraform: it must keep watching spend even while
+# the app stack is torn down (Bedrock/OpenAI calls, or someone hammering the
+# Function URL, cost money regardless of Lambda's own on/off state). No IAM
+# change needed here — this runs once, manually, as the admin user.
+cat > "${TMP}/budget.json" <<JSON
+{
+  "BudgetName": "${BUDGET_NAME}",
+  "BudgetLimit": { "Amount": "${BUDGET_LIMIT_USD}", "Unit": "USD" },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}
+JSON
+cat > "${TMP}/notifications.json" <<JSON
+[
+  { "Notification": { "NotificationType": "ACTUAL", "ComparisonOperator": "GREATER_THAN", "Threshold": 80, "ThresholdType": "PERCENTAGE" },
+    "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "${ALERT_EMAIL}" }] },
+  { "Notification": { "NotificationType": "FORECASTED", "ComparisonOperator": "GREATER_THAN", "Threshold": 100, "ThresholdType": "PERCENTAGE" },
+    "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "${ALERT_EMAIL}" }] }
+]
+JSON
+
+if aws budgets describe-budget --account-id "${ACCOUNT_ID}" --budget-name "${BUDGET_NAME}" >/dev/null 2>&1; then
+  echo ">> [4/4] Budget ${BUDGET_NAME} already exists — updating limit..."
+  aws budgets update-budget --account-id "${ACCOUNT_ID}" --new-budget "file://${TMP}/budget.json" >/dev/null
+else
+  echo ">> [4/4] Creating budget ${BUDGET_NAME} (\$${BUDGET_LIMIT_USD}/mo, alerts to ${ALERT_EMAIL})..."
+  aws budgets create-budget --account-id "${ACCOUNT_ID}" \
+    --budget "file://${TMP}/budget.json" \
+    --notifications-with-subscribers "file://${TMP}/notifications.json" >/dev/null
+fi
+echo "   AWS Budgets emails directly — no confirmation-link step (unlike the SNS alarm topic above)."
+
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 echo ""
 echo ">> DONE. Set these in GitHub (repo → Settings → Secrets and variables → Actions):"
 echo "     Variable  AWS_ROLE_ARN = ${ROLE_ARN}"
 echo "     Variable  AWS_REGION   = ${REGION}"
 echo "     Secret    OPENAI_API_KEY = <your key>"
+echo "     Secret    LANGFUSE_PUBLIC_KEY = <optional; from cloud.langfuse.com>"
+echo "     Secret    LANGFUSE_SECRET_KEY = <optional; from cloud.langfuse.com>"
 echo ""
 echo "   State backend (already referenced in infra/backend.tf):"
 echo "     bucket=${STATE_BUCKET}  key=citementor/terraform.tfstate  region=${REGION}"
