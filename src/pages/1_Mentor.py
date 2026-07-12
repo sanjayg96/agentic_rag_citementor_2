@@ -16,6 +16,23 @@ with open("config/retrieval.yaml", "r") as f:
 
 os.environ.setdefault("DEEPEVAL_TELEMETRY_OPT_OUT", "YES")
 
+def _get_openai_key() -> str | None:
+    """OpenAI key for the DeepEval grader. Locally it comes from .env (already in the
+    environment); on Streamlit Cloud it lives in st.secrets, so fall back to that."""
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return None
+
+# DeepEval and the OpenAI SDK read OPENAI_API_KEY from the environment. On Streamlit
+# Cloud the key is only in st.secrets, so export it so live grading works in remote mode.
+_openai_key = _get_openai_key()
+if _openai_key and not os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = _openai_key
+
 # Phase 8 toggle: when AWS credentials are present in st.secrets, the app calls
 # the deployed Function URL; otherwise it runs the pipeline locally (as master does).
 remote_config = api_client.load_config()
@@ -103,22 +120,32 @@ else:
     st.sidebar.info("💻 Running the local pipeline")
 
 st.sidebar.markdown("### ⚙️ Controls")
+# Live DeepEval grades the answer with an OpenAI model against the retrieved sources.
+# It runs in-process either way — in remote mode the Lambda returns the sources, so
+# grading works here as long as an OpenAI key is available. In local mode we also
+# require inference_mode=openai so the app otherwise stays fully local.
 openai_mode = config["system"].get("inference_mode") == "openai"
-# Live DeepEval grades responses locally, so it is only offered when the pipeline
-# runs in-process. In remote mode the grading contexts live on Lambda, not here.
 if USE_REMOTE:
-    run_eval = False
-else:
-    run_eval = st.sidebar.toggle(
-        "🔬 Enable Live DeepEval",
-        value=False,
-        disabled=not openai_mode,
-        help=(
-            "Uses DeepEval with OpenAI to grade the response. Adds evaluation latency."
-            if openai_mode
-            else "Live API evals are disabled in local mode so the full app stays local."
-        )
+    eval_available = bool(_openai_key)
+    eval_help = (
+        "Grades the answer with DeepEval (OpenAI) against the sources returned by the "
+        "Lambda. Adds evaluation latency."
+        if eval_available
+        else "Add OPENAI_API_KEY to this app's Streamlit secrets to enable DeepEval grading."
     )
+else:
+    eval_available = openai_mode
+    eval_help = (
+        "Uses DeepEval with OpenAI to grade the response. Adds evaluation latency."
+        if openai_mode
+        else "Live API evals are disabled in local mode so the full app stays local."
+    )
+run_eval = st.sidebar.toggle(
+    "🔬 Enable Live DeepEval",
+    value=False,
+    disabled=not eval_available,
+    help=eval_help,
+)
 
 if st.sidebar.button("🗑️ Reset Session", use_container_width=True):
     st.session_state.clear()
