@@ -20,4 +20,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "einops>=0.8.2",
     "torchvision>=0.26.0",
+    # Phase 8: the Streamlit UI SigV4-signs requests to the deployed Lambda
+    # Function URL and discovers it via GetFunctionUrlConfig (src/utils/api_client.py).
+    "boto3>=1.34.0",
 ]

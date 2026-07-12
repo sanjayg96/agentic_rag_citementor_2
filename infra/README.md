@@ -59,6 +59,20 @@ Preferred path is the **Actions** tab — **Deploy** / **Teardown** workflows (G
 OIDC, no keys). One-time setup lives in [`bootstrap.sh`](bootstrap.sh) (state bucket +
 OIDC provider + scoped role). See [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) §6.
 
+## Streamlit UI on the deployed Lambda (Phase 8)
+
+[`streamlit_user.sh`](streamlit_user.sh) creates a dedicated least-privilege IAM user
+(`citementor-streamlit`) that can only discover + invoke the Function URL, and prints an
+`[aws]` secrets block to paste into a Streamlit Community Cloud app (branch `aws-deploy`,
+main file `src/app.py`). Like `bootstrap.sh`, it lives outside the app Terraform so its
+access key survives `destroy` → the Streamlit secret never needs re-editing across
+deploy/teardown cycles. See [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) §15.
+
+```bash
+bash infra/streamlit_user.sh            # create user + policy, mint a key
+bash infra/streamlit_user.sh --rotate   # replace the key
+```
+
 ## Notes
 
 - **State is remote** in S3 with native locking (`backend.tf`) so CI and local share it.

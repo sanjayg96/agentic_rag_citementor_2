@@ -83,7 +83,7 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 - [x] **Phase 5** — Terraform for the whole stack; verify destroy/apply lifecycle
 - [x] **Phase 6** — GitHub Actions CI/CD (OIDC, native ARM64 runners, S3 remote state)
 - [x] **Phase 7** — Langfuse tracing + CloudWatch alarms + Budget alert
-- [ ] **Phase 8** — Streamlit optionally calls the deployed API (env-driven), graceful degradation
+- [x] **Phase 8** — Streamlit optionally calls the deployed API (env-driven), graceful degradation
 - [ ] **Phase 9** — `DEPLOYMENT.md` (architecture, deploy/teardown, cost, secrets, observability)
 - [ ] **Post-pass** — scoped least-privilege IAM policy (replace `AdministratorAccess`), documented
 
@@ -131,8 +131,13 @@ New `service/` dir importing the existing core unchanged:
 - **Phase 6:** GitHub Actions on push to `aws-deploy`: buildx `--platform linux/arm64` (x86 runners
   → QEMU), push ECR, update Lambda. **OIDC role**, not long-lived keys. Verify arch match.
 - **Phase 7:** Langfuse tracing in service; CloudWatch alarms (error rate, p95); AWS Budget ~$5/mo.
-- **Phase 8:** Env toggle in Streamlit to call deployed API; deploy that variant to Community Cloud
-  (always-on), independent of AWS up/down; graceful error if API torn down.
+- **Phase 8 ✅:** Env toggle in Streamlit (`src/utils/api_client.py`) — when AWS creds are present
+  in `st.secrets`, the Mentor page SigV4-signs requests to the Function URL; otherwise it runs the
+  pipeline locally (so `master`'s deploy is untouched). URL is auto-discovered via
+  `GetFunctionUrlConfig` (it changes each deploy cycle), so the always-on Community Cloud app needs
+  no edits between demos. Graceful in-chat message when the stack is torn down. A dedicated
+  least-privilege IAM user (`citementor-streamlit`, created by `infra/streamlit_user.sh`, outside
+  the ephemeral Terraform so its key survives teardown) is the only thing that can invoke the URL.
 - **Phase 9:** `DEPLOYMENT.md` — architecture, deploy (`terraform apply` + CI/CD), teardown
   (`terraform destroy`), cost, secrets + observability wiring.
 - **Post-pass:** scoped least-privilege IAM (Lambda, ECR, API Gateway, IAM-for-exec-role, Secrets

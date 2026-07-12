@@ -8,9 +8,9 @@
 > 2. **Learning guide** — explain *why* each AWS service and each line of config exists, from first principles.
 > 3. **Interview reference** — every decision here is defensible; this is the script for talking through it.
 >
-> It is a living document. It currently covers **Phases 0–7** (extract → containerize →
-> bundle data → deploy → secrets → Terraform → CI/CD → observability + cost guardrails).
-> Phases 8–9 (Streamlit integration, final hardening) will be appended as they land.
+> It is a living document. It currently covers **Phases 0–8** (extract → containerize →
+> bundle data → deploy → secrets → Terraform → CI/CD → observability + cost guardrails →
+> Streamlit UI on the deployed Lambda). Phase 9 (final hardening) will be appended as it lands.
 >
 > Companion files: [`aws-deployment.md`](aws-deployment.md) is the terse resumable
 > tracker (checkboxes + session log). [`../infra/README.md`](../infra/README.md) is
@@ -887,30 +887,88 @@ This document grows with the project. Planned additions:
 - **Phase 7 — Observability + guardrails on cost.** ✅ Done and verified live: Langfuse
   tracing in the service (optional); CloudWatch alarms (error rate, p95 latency); a
   standing AWS Budget (~\$5/mo). See §6 for the full verification story.
-- **Phase 8 — Streamlit integration.** An env toggle so the Streamlit app can call the
-  deployed API, with graceful degradation when the stack is torn down.
+- **Phase 8 — Streamlit integration.** ✅ Done. An env/secrets toggle lets the Streamlit app
+  call the deployed Function URL (SigV4-signed) instead of running the pipeline locally, with
+  graceful degradation when the stack is torn down. See §15 below.
 - **Phase 9 — Final hardening + this doc made exhaustive.** Scoped least-privilege IAM to
   replace `AdministratorAccess`; complete the architecture/runbook/cost/observability
   reference.
 
-### The demo flow — run everything from GitHub (Phase 6 ✅, Phase 8 pending)
+### The demo flow — run everything from GitHub (Phase 6 ✅, Phase 8 ✅)
 
-CI/CD is live, so giving a demo is already down to:
+CI/CD is live, so giving a demo is down to:
 
 1. GitHub → **Actions** → **Deploy** → *Run workflow* → pick `bedrock` or `openai` → it
    assumes the AWS role via OIDC and runs `terraform apply` (the run summary prints the
    Function URL).
-2. Warm up and demo. **Today** that's `scripts/demo_query.sh` (SigV4-signed). **After
-   Phase 8** it'll be the Streamlit app calling the deployed API.
+2. Warm up and demo. Either `scripts/demo_query.sh` (terminal, SigV4-signed) **or** the
+   Streamlit UI deployed from `aws-deploy` (see §15) — both hit the same Function URL. The
+   UI auto-discovers the current URL, so nothing to update per deploy.
 3. GitHub → **Actions** → **Teardown** → *Run workflow* → `terraform destroy` → **\$0**.
+   The Streamlit UI keeps running and shows a friendly "backend offline" message until the
+   next deploy.
 
 **One-time step before the next deploy (Phase 7):** re-run `bash infra/bootstrap.sh` to
 grant the CI role the new SNS/CloudWatch permissions, and optionally add the
 `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` repo secrets if you want traced queries.
 
-**Still to wire for Phase 8 — Streamlit → Function URL auth.** The URL is `AWS_IAM`, so the
-Streamlit app must SigV4-sign its requests using AWS credentials stored as Streamlit secrets
-(or we add a separate public-auth front door). It's why the endpoint isn't just a plain
-public URL.
+---
 
-> _Last updated: 2026-07-09 — covers Phases 0–7 + the Bedrock inference mode._
+## 15. Phase 8 — Streamlit UI → deployed Lambda
+
+The goal: give demos from a polished Streamlit UI on Community Cloud that talks to the AWS
+stack, without disturbing the existing `master` deployment (which runs the pipeline locally
+in the Streamlit process). Two apps, one codebase, distinguished only by their secrets.
+
+### How the toggle works
+
+`src/pages/1_Mentor.py` calls `api_client.load_config()` at startup:
+
+- **No AWS creds in `st.secrets`** (the `master` app) → runs the compiled LangGraph
+  in-process, exactly as before. The heavy retrieval/inference stack is imported lazily so
+  this path is unchanged.
+- **AWS creds present** (the `aws-deploy` app) → the page becomes a thin front end:
+  `src/utils/api_client.py::CiteMentorRemoteAPI` SigV4-signs a `POST /query` to the Function
+  URL and renders the returned answer + source-citation ledger. A sidebar badge shows which
+  mode is active.
+
+The presence of the `[aws]` secrets block is the whole switch — no code branch per branch.
+
+### Why a dedicated IAM user, and why it lives outside Terraform
+
+The Function URL is `AWS_IAM` auth (this account blocks anonymous URLs), and Streamlit Cloud
+can't use the OIDC path the CI role uses — it needs a long-lived key. `infra/streamlit_user.sh`
+creates **`citementor-streamlit`**, a user whose *only* permissions are:
+
+- `lambda:GetFunctionUrlConfig` on `citementor-api` — discover the current URL.
+- `lambda:InvokeFunctionUrl` on `citementor-api` (AWS_IAM URLs only) — call it.
+
+It is scoped to the function *by name* (stable across deploys) and created **outside** the app
+Terraform on purpose — the stack is destroyed to \$0 between demos, so a key managed inside it
+would be regenerated every cycle and break the Streamlit secret. Living outside, the one key
+survives teardown→redeploy untouched. The Function URL's random subdomain *does* change each
+cycle, which is why the app discovers it at call time instead of hard-coding it.
+
+### One-time setup
+
+```bash
+# 1. As an admin (citementor-deploy), mint the scoped user + access key:
+bash infra/streamlit_user.sh          # prints a ready-to-paste [aws] secrets block
+
+# 2. On Streamlit Community Cloud, create a NEW app:
+#    - Repo: this repo, Branch: aws-deploy, Main file: src/app.py
+#    - Settings → Secrets → paste the [aws] block from step 1
+#    (see .streamlit/secrets.toml.example for the exact shape)
+```
+
+Rotate the key any time with `bash infra/streamlit_user.sh --rotate`. `master`'s app has no
+`[aws]` secret, so it stays local no matter what.
+
+### Graceful degradation
+
+When the stack is torn down, `GetFunctionUrlConfig` returns `ResourceNotFoundException`; the
+client raises `BackendOfflineError` and the chat shows *"The AWS backend is currently offline
+(scaled to \$0). Bring it up via GitHub → Actions → Deploy…"* instead of erroring out. First
+call after a deploy pays the ~40–50s cold start; the client timeout (130s) allows for it.
+
+> _Last updated: 2026-07-12 — covers Phases 0–8 + the Bedrock inference mode._

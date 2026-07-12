@@ -5,16 +5,29 @@ import sys
 import yaml
 import streamlit as st
 
-from src.core.graph import app_graph
+# NOTE: src.core.graph is imported lazily inside the local-pipeline branch only.
+# In remote mode (Phase 8) the UI is a thin front end to the deployed Lambda, so
+# it must not pull in the heavy retrieval/inference stack (chromadb, rerankers, …).
 from src.core.ledger import record_transaction
+from src.utils import api_client
 
 with open("config/retrieval.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 os.environ.setdefault("DEEPEVAL_TELEMETRY_OPT_OUT", "YES")
 
+# Phase 8 toggle: when AWS credentials are present in st.secrets, the app calls
+# the deployed Function URL; otherwise it runs the pipeline locally (as master does).
+remote_config = api_client.load_config()
+USE_REMOTE = remote_config is not None
+remote_api = api_client.CiteMentorRemoteAPI(remote_config) if USE_REMOTE else None
+
 st.title("💬 CiteMentor 2.0")
-st.caption("Agentic Mentorship powered by Local MLX & Hybrid RAG")
+st.caption(
+    "Agentic Mentorship — served from AWS Lambda"
+    if USE_REMOTE
+    else "Agentic Mentorship powered by Local MLX & Hybrid RAG"
+)
 
 # Load Catalog for Titles
 try:
@@ -80,18 +93,32 @@ if "latency_spans" not in st.session_state:
     st.session_state["latency_spans"] = []
 
 # Sidebar Controls & Ledger
+if USE_REMOTE:
+    st.sidebar.success("🟢 Connected to AWS Lambda")
+    st.sidebar.caption(
+        "Queries run on the deployed serverless backend. The first call after a "
+        "fresh deploy pays a cold start (~40–50s)."
+    )
+else:
+    st.sidebar.info("💻 Running the local pipeline")
+
 st.sidebar.markdown("### ⚙️ Controls")
 openai_mode = config["system"].get("inference_mode") == "openai"
-run_eval = st.sidebar.toggle(
-    "🔬 Enable Live DeepEval",
-    value=False,
-    disabled=not openai_mode,
-    help=(
-        "Uses DeepEval with OpenAI to grade the response. Adds evaluation latency."
-        if openai_mode
-        else "Live API evals are disabled in local mode so the full app stays local."
+# Live DeepEval grades responses locally, so it is only offered when the pipeline
+# runs in-process. In remote mode the grading contexts live on Lambda, not here.
+if USE_REMOTE:
+    run_eval = False
+else:
+    run_eval = st.sidebar.toggle(
+        "🔬 Enable Live DeepEval",
+        value=False,
+        disabled=not openai_mode,
+        help=(
+            "Uses DeepEval with OpenAI to grade the response. Adds evaluation latency."
+            if openai_mode
+            else "Live API evals are disabled in local mode so the full app stays local."
+        )
     )
-)
 
 if st.sidebar.button("🗑️ Reset Session", use_container_width=True):
     st.session_state.clear()
@@ -134,96 +161,160 @@ if prompt := st.chat_input("Ask for mentorship or advice..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Status panel messages keyed by graph node name. The cache node is named
-    # "cache_lookup" in the graph but records its span under "semantic_cache".
-    NODE_STATUS_MESSAGES = {
-        "input_guard": "Input guardrail: checking safety boundaries",
-        "cache_lookup": "Semantic cache: checking previous grounded answers",
-        "router": "Router: classifying intent and expanding the query",
-        "retriever": "Retriever: running semantic search, BM25, fusion, and reranking",
-        "output_guard": "Output guardrail: validating the grounded answer",
-    }
-
     with st.chat_message("assistant"):
         eval_data_to_save = None
         eval_error_to_save = None
         processed_sources = []
 
-        status = st.status("Running CiteMentor pipeline...", expanded=True)
-        answer_placeholder = st.empty()
-        streamed_answer = ""
-        synthesis_announced = False
-        final = {}
+        if USE_REMOTE:
+            # --- Remote branch: thin, SigV4-signed client over the Function URL ---
+            # The Lambda runs the *same* pipeline (guardrails, cache, routing,
+            # retrieval, synthesis) server-side and returns the final state, so the
+            # UI just displays it. No token streaming or node-by-node status here.
+            answer = ""
+            cache_hit = False
+            cache_similarity = 0.0
+            retrieved_chunks = []
+            route = None
+            timings = {}
+            request_failed = False
 
-        # Drive the compiled LangGraph: "updates" powers the status panel,
-        # "custom" carries streamed synthesis tokens from get_stream_writer().
-        for mode, chunk in app_graph.stream(
-            {"query": prompt, "timings": {}}, stream_mode=["updates", "custom"]
-        ):
-            if mode == "custom":
-                if not synthesis_announced:
-                    status.write("Synthesizer: streaming grounded answer")
-                    synthesis_announced = True
-                streamed_answer += chunk
-                answer_placeholder.markdown(streamed_answer + "▌")
-                continue
-
-            for node, update in chunk.items():
-                update = update or {}
-                final.update(update)
-
-                message = NODE_STATUS_MESSAGES.get(node)
-                if message:
-                    status.write(message)
-                if node == "cache_lookup" and final.get("cache_hit"):
-                    status.write(
-                        f"Semantic cache hit ({final.get('cache_similarity', 0.0):.2f} similarity)"
+            status = st.status("Contacting CiteMentor on AWS Lambda…", expanded=True)
+            try:
+                status.write("Signing the request and invoking the Function URL")
+                data = remote_api.query(prompt)
+            except api_client.BackendOfflineError:
+                answer = (
+                    "⚠️ The AWS backend is currently offline (scaled to $0). Bring it "
+                    "up via GitHub → **Actions → Deploy**, wait for it to finish, then ask again."
+                )
+                status.update(label="Backend offline", state="error")
+                st.warning(answer)
+                request_failed = True
+            except api_client.BackendError as exc:
+                answer = f"⚠️ The request to the AWS backend failed: {exc}"
+                status.update(label="Request failed", state="error")
+                st.error(answer)
+                request_failed = True
+            else:
+                answer = data.get("answer", "")
+                cache_hit = bool(data.get("cache_hit", False))
+                cache_similarity = float(data.get("cache_similarity") or 0.0)
+                retrieved_chunks = data.get("sources") or []
+                route = data.get("route")
+                timings = data.get("timings") or {}
+                st.markdown(answer)
+                if cache_hit:
+                    status.update(
+                        label=f"Served from semantic cache ({cache_similarity:.2f})", state="complete"
                     )
-                if node == "router":
-                    status.write(f"Route selected: `{final.get('route')}`")
-                if node == "retriever":
-                    status.write(
-                        f"Retriever returned `{len(final.get('retrieved_chunks', []))}` final source chunks"
-                    )
+                    st.caption("Semantic cache hit on the server.")
+                else:
+                    status.update(label="Answer received from AWS Lambda", state="complete")
 
-        # Reconcile final answer: output guard may revise it, and cache hits /
-        # terminal routes never stream tokens.
-        answer = final.get("answer", streamed_answer)
-        cache_hit = bool(final.get("cache_hit", False))
-        cache_similarity = float(final.get("cache_similarity", 0.0))
-        retrieved_chunks = final.get("retrieved_chunks", [])
-        route = final.get("route")
-        timings = final.get("timings", {})
-
-        if final.get("is_safe") is False:
-            answer_placeholder.error(answer)
-            status.update(label="Blocked by input guardrail", state="error")
-        elif cache_hit:
-            answer_placeholder.markdown(answer)
-            status.update(label=f"Served from semantic cache ({cache_similarity:.2f})", state="complete")
-            st.caption(f"Semantic cache hit from: {final.get('matched_query', prompt)}")
+            if request_failed:
+                # Persist the notice to history and stop; nothing to cite/eval.
+                st.session_state.messages.append({
+                    "role": "assistant", "content": answer, "sources": [],
+                    "eval": None, "eval_error": None, "timings": {},
+                    "cache_hit": False, "cache_similarity": 0.0,
+                })
+                st.rerun()
         else:
-            answer_placeholder.markdown(answer)
-            status.update(label="Pipeline complete", state="complete")
-            if final.get("output_is_safe") is False:
-                st.warning("Output guardrail revised the response before saving it.")
+            # --- Local branch: drive the compiled LangGraph in-process ---
+            # Status panel messages keyed by graph node name. The cache node is named
+            # "cache_lookup" in the graph but records its span under "semantic_cache".
+            NODE_STATUS_MESSAGES = {
+                "input_guard": "Input guardrail: checking safety boundaries",
+                "cache_lookup": "Semantic cache: checking previous grounded answers",
+                "router": "Router: classifying intent and expanding the query",
+                "retriever": "Retriever: running semantic search, BM25, fusion, and reranking",
+                "output_guard": "Output guardrail: validating the grounded answer",
+            }
 
+            # Imported here (not at module top) so remote deployments never load the
+            # heavy retrieval/inference stack.
+            from src.core.graph import app_graph
+
+            status = st.status("Running CiteMentor pipeline...", expanded=True)
+            answer_placeholder = st.empty()
+            streamed_answer = ""
+            synthesis_announced = False
+            final = {}
+
+            # Drive the compiled LangGraph: "updates" powers the status panel,
+            # "custom" carries streamed synthesis tokens from get_stream_writer().
+            for mode, chunk in app_graph.stream(
+                {"query": prompt, "timings": {}}, stream_mode=["updates", "custom"]
+            ):
+                if mode == "custom":
+                    if not synthesis_announced:
+                        status.write("Synthesizer: streaming grounded answer")
+                        synthesis_announced = True
+                    streamed_answer += chunk
+                    answer_placeholder.markdown(streamed_answer + "▌")
+                    continue
+
+                for node, update in chunk.items():
+                    update = update or {}
+                    final.update(update)
+
+                    message = NODE_STATUS_MESSAGES.get(node)
+                    if message:
+                        status.write(message)
+                    if node == "cache_lookup" and final.get("cache_hit"):
+                        status.write(
+                            f"Semantic cache hit ({final.get('cache_similarity', 0.0):.2f} similarity)"
+                        )
+                    if node == "router":
+                        status.write(f"Route selected: `{final.get('route')}`")
+                    if node == "retriever":
+                        status.write(
+                            f"Retriever returned `{len(final.get('retrieved_chunks', []))}` final source chunks"
+                        )
+
+            # Reconcile final answer: output guard may revise it, and cache hits /
+            # terminal routes never stream tokens.
+            answer = final.get("answer", streamed_answer)
+            cache_hit = bool(final.get("cache_hit", False))
+            cache_similarity = float(final.get("cache_similarity", 0.0))
+            retrieved_chunks = final.get("retrieved_chunks", [])
+            route = final.get("route")
+            timings = final.get("timings", {})
+
+            if final.get("is_safe") is False:
+                answer_placeholder.error(answer)
+                status.update(label="Blocked by input guardrail", state="error")
+            elif cache_hit:
+                answer_placeholder.markdown(answer)
+                status.update(label=f"Served from semantic cache ({cache_similarity:.2f})", state="complete")
+                st.caption(f"Semantic cache hit from: {final.get('matched_query', prompt)}")
+            else:
+                answer_placeholder.markdown(answer)
+                status.update(label="Pipeline complete", state="complete")
+                if final.get("output_is_safe") is False:
+                    st.warning("Output guardrail revised the response before saving it.")
+
+        # --- Shared tail (both branches): badges, source ledger, eval, save ---
         if route == "out_of_scope":
             st.info("Badge: Public Domain Knowledge (Zero Charge)")
             st.session_state.gaps_log.append({"query": prompt})
 
-        # Source cards + micro-royalty ledger (UI concern, reads final state).
+        # Source cards + micro-royalty ledger. Fields are read defensively so the
+        # remote payload (sources may carry null author/book_id) renders cleanly.
         if retrieved_chunks:
             st.markdown("---")
             st.markdown("### 📚 Source Citations & Ledger")
             for chunk in retrieved_chunks:
-                cost = record_transaction(st.session_state, chunk["book_id"])
+                book_id = chunk.get("book_id")
+                cost = record_transaction(st.session_state, book_id) if book_id else 0.0
                 chunk["cost"] = cost
                 processed_sources.append(chunk)
-                title = catalog_data.get(chunk["book_id"], {}).get("title", chunk["book_id"])
-                with st.expander(f"📖 {title} | Author: {chunk['author']}"):
+                title = catalog_data.get(book_id, {}).get("title", book_id or "Unknown source")
+                author = chunk.get("author") or "Unknown"
+                with st.expander(f"📖 {title} | Author: {author}"):
                     st.markdown(f"**Snippet Cost:** `${cost:.6f}`")
-                    st.write(chunk["text"])
+                    st.write(chunk.get("text", ""))
 
         # --- LIVE EVALUATION ---
         if run_eval and retrieved_chunks:
