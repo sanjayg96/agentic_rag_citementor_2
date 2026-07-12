@@ -45,13 +45,16 @@ fi
 
 # --- 2. Least-privilege inline policy ---------------------------------------
 # GetFunctionUrlConfig: discover the current URL (it changes each deploy).
-# InvokeFunctionUrl: call it. Scoped to this one function's ARN — that is the whole
-# authorization boundary. We deliberately do NOT add a
-# `lambda:FunctionUrlAuthType == AWS_IAM` condition: the real Function URL invoke
-# request does not reliably populate that condition key, so requiring it caused the
-# invoke to be denied (403) even though discovery was allowed. The condition would be
-# redundant anyway — the URL's auth type is hard-pinned to AWS_IAM in lambda.tf and
-# this account blocks public URLs.
+# InvokeFunctionUrl + InvokeFunction: call it. BOTH are required — since
+# October 2025, AWS requires `lambda:InvokeFunction` (not just
+# `lambda:InvokeFunctionUrl`) to invoke an AWS_IAM function URL, and a URL created
+# after that returns 403 Forbidden with InvokeFunctionUrl alone. See
+# https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html.
+#
+# Everything is scoped to this one function's ARN — that is the whole authorization
+# boundary. We deliberately do NOT add a `lambda:FunctionUrlAuthType == AWS_IAM`
+# condition: it is redundant (the URL's auth type is hard-pinned to AWS_IAM in
+# lambda.tf and this account blocks public URLs) and only adds a way to get it wrong.
 TMP="$(mktemp -d)"; trap 'rm -rf "${TMP}"' EXIT
 cat > "${TMP}/policy.json" <<JSON
 {
@@ -66,7 +69,7 @@ cat > "${TMP}/policy.json" <<JSON
     {
       "Sid": "InvokeFunctionUrl",
       "Effect": "Allow",
-      "Action": ["lambda:InvokeFunctionUrl"],
+      "Action": ["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"],
       "Resource": "${FUNCTION_ARN}"
     }
   ]

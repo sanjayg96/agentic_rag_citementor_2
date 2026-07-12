@@ -941,12 +941,16 @@ can't use the OIDC path the CI role uses — it needs a long-lived key. `infra/s
 creates **`citementor-streamlit`**, a user whose *only* permissions are:
 
 - `lambda:GetFunctionUrlConfig` on `citementor-api` — discover the current URL.
-- `lambda:InvokeFunctionUrl` on `citementor-api` — call it.
+- `lambda:InvokeFunctionUrl` **and** `lambda:InvokeFunction` on `citementor-api` — call it.
 
-(Scoping is by the function ARN alone. An earlier version added a
-`lambda:FunctionUrlAuthType == AWS_IAM` condition, but the live invoke request
-doesn't reliably populate that condition key, so it denied the call with a 403 —
-and it's redundant anyway since the URL's auth type is hard-pinned in `lambda.tf`.)
+**Both invoke actions are required.** Since October 2025, AWS requires
+`lambda:InvokeFunction` (not just `lambda:InvokeFunctionUrl`) to invoke an
+`AWS_IAM` function URL created after that date — with `InvokeFunctionUrl` alone the
+call returns `403 {"Message":"Forbidden"}`, and the IAM policy simulator won't flag
+it because `InvokeFunctionUrl` on its own genuinely *is* allowed. Scoping is by the
+function ARN alone; we don't add a `lambda:FunctionUrlAuthType` condition (redundant —
+the URL's auth type is hard-pinned in `lambda.tf` — and just one more thing to get
+wrong). Ref: <https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html>.
 
 It is scoped to the function *by name* (stable across deploys) and created **outside** the app
 Terraform on purpose — the stack is destroyed to \$0 between demos, so a key managed inside it
