@@ -84,8 +84,11 @@ local gitignored state (solo project; remote S3+DynamoDB state is a noted team e
 - [x] **Phase 6** — GitHub Actions CI/CD (OIDC, native ARM64 runners, S3 remote state)
 - [x] **Phase 7** — Langfuse tracing + CloudWatch alarms + Budget alert
 - [x] **Phase 8** — Streamlit optionally calls the deployed API (env-driven), graceful degradation
-- [ ] **Phase 9** — `DEPLOYMENT.md` (architecture, deploy/teardown, cost, secrets, observability)
-- [ ] **Post-pass** — scoped least-privilege IAM policy (replace `AdministratorAccess`), documented
+- [x] **Phase 9** — `DEPLOYMENT.md` (architecture, deploy/teardown, cost, secrets, observability) + README/About
+- [ ] **Post-pass (deferred)** — scope the human `citementor-deploy` user off `AdministratorAccess`.
+      Deliberately deferred: CI role, Lambda role, and Streamlit user are already scoped; only the
+      one-time bootstrap identity stays broad, and scoping it needs a full stand-up to validate.
+      Plan + sketch in `docs/DEPLOYMENT.md` §16.
 
 ---
 
@@ -138,10 +141,14 @@ New `service/` dir importing the existing core unchanged:
   no edits between demos. Graceful in-chat message when the stack is torn down. A dedicated
   least-privilege IAM user (`citementor-streamlit`, created by `infra/streamlit_user.sh`, outside
   the ephemeral Terraform so its key survives teardown) is the only thing that can invoke the URL.
-- **Phase 9:** `DEPLOYMENT.md` — architecture, deploy (`terraform apply` + CI/CD), teardown
-  (`terraform destroy`), cost, secrets + observability wiring.
-- **Post-pass:** scoped least-privilege IAM (Lambda, ECR, API Gateway, IAM-for-exec-role, Secrets
-  Manager, CloudWatch, Budgets); verify stack still works; document broad + scoped policies.
+- **Phase 9 ✅:** `DEPLOYMENT.md` — architecture, deploy (`terraform apply` + CI/CD), teardown
+  (`terraform destroy`), cost, secrets + observability wiring — plus the README "Deployment"
+  section and the mode-aware Streamlit About page.
+- **Post-pass (deferred):** scope the human `citementor-deploy` user off `AdministratorAccess`.
+  The automated/continuous identities (CI role, Lambda exec role, Streamlit user) are already
+  least-privilege; only the one-time bootstrap identity stays broad. Deferred because bootstrap
+  inherently needs broad IAM and the change can't be validated without a full stand-up. Rationale
+  + a scoped-policy sketch live in `DEPLOYMENT.md` §16.
 
 ---
 

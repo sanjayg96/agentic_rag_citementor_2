@@ -38,8 +38,10 @@ An AI-assisted "Mentor" that sits on top of a curated library of high-quality no
 This is version 2 of the project. Version 1 proved the core idea with a small
 three-book public-domain demo. Version 2 turns it into a fuller applied AI
 engineering portfolio project with local ingestion, LangGraph orchestration,
-hybrid retrieval, guardrails, evals, observability, and deployment-friendly
-OpenAI inference mode.
+hybrid retrieval, guardrails, evals, observability, a deployment-friendly OpenAI
+inference mode, and a reproducible **serverless AWS deployment** (Lambda +
+Terraform + CI/CD) that the Streamlit UI can talk to. See
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the full cloud story.
 
 ## Architecture
 
@@ -78,7 +80,7 @@ OpenAI inference mode.
 | Safety | Minimal | Input and output guardrails |
 | Observability | Minimal | Dashboard, DeepEval evals, latency spans, cache hits, gap logging |
 | Attribution | Source display | Source display plus micro-royalty ledger |
-| Deployment | Demo-focused | Local mode plus OpenAI API mode |
+| Deployment | Demo-focused | Local + OpenAI modes, plus a serverless AWS backend (Lambda, Terraform, GitHub Actions CI/CD) |
 
 
 ## Inference Modes
@@ -124,6 +126,32 @@ openai:
   eval_model: "gpt-5-mini"
 ```
 
+## Deployment
+
+There are two ways CiteMentor 2.0 is served, from the **same codebase**:
+
+1. **Streamlit runs the pipeline in-process** — the classic app. Local MLX (or OpenAI)
+   inference, Chroma + BM25 served straight from the app process. This is the default
+   and how the `master` deployment runs.
+2. **Streamlit as a thin client over a serverless AWS backend** — the whole RAG pipeline
+   runs on **AWS Lambda** (container image, ARM64/Graviton) behind a **Lambda Function URL**
+   with `AWS_IAM` auth, provisioned entirely by **Terraform** and deployed/torn down from
+   **GitHub Actions** (OIDC — no long-lived cloud keys). It scales to **~\$0** when idle.
+
+The switch is just configuration: when AWS credentials are present in the Streamlit app's
+secrets, the Mentor page SigV4-signs requests to the Function URL (auto-discovering its
+current URL) and renders the result; when they're absent, it runs the pipeline locally.
+So one branch can drive both a local app and a cloud-backed app.
+
+- **Service wrapper:** [`service/app.py`](service/app.py) — a thin FastAPI + Mangum adapter
+  over the *same* compiled LangGraph, no duplicated logic.
+- **Remote client:** [`src/utils/api_client.py`](src/utils/api_client.py) — URL discovery,
+  SigV4 signing, and graceful degradation when the stack is torn down.
+- **Infrastructure:** [`infra/`](infra) — Terraform for ECR, Lambda, Function URL, IAM,
+  Secrets Manager, CloudWatch alarms + SNS; `bootstrap.sh` (CI/CD prerequisites) and
+  `streamlit_user.sh` (a least-privilege IAM user for the UI).
+- **Full narrative + runbook:** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 ## Tech Stack
 
 - **UI:** Streamlit
@@ -137,6 +165,9 @@ openai:
 - **OpenAI models:** Configurable GPT-5 family models and
   `text-embedding-3-small`
 - **Evaluation:** DeepEval
+- **Serverless backend:** AWS Lambda (container, ARM64) + Function URL, ECR,
+  Secrets Manager, CloudWatch + SNS
+- **Infrastructure & CI/CD:** Terraform, GitHub Actions (OIDC), FastAPI + Mangum
 
 ## Project Structure
 
@@ -153,15 +184,26 @@ openai:
 │   │   ├── semantic_cache.py   # Persistent semantic answer cache
 │   │   └── retriever.py        # Hybrid retrieval and reranking
 │   ├── pages/
-│   │   ├── 1_Mentor.py         # Chat interface
+│   │   ├── 1_Mentor.py         # Chat interface (local pipeline OR remote Lambda)
 │   │   ├── 2_Dashboard.py      # evaluation, latency, and gap observability
 │   │   ├── 3_Ledger.py         # Royalty ledger page
 │   │   └── 4_About.py          # Portfolio project overview
 │   └── utils/
-│       └── ingestion.py        # Local ingestion pipeline
+│       ├── ingestion.py        # Local ingestion pipeline
+│       └── api_client.py       # SigV4 client for the deployed Lambda (Phase 8)
+├── service/                    # FastAPI + Mangum wrapper for AWS Lambda
+│   ├── app.py                  # /health + /query over the same LangGraph
+│   ├── Dockerfile              # ARM64 container image
+│   └── requirements.txt        # Slim, OpenAI-only dependency set
+├── infra/                      # Terraform for the serverless stack + bootstrap scripts
+├── docs/
+│   ├── DEPLOYMENT.md           # Full AWS deployment narrative + runbook
+│   └── aws-deployment.md       # Terse phase tracker
 ├── storage/
 │   ├── chroma_db/              # Persistent Chroma database
 │   └── bm25/                   # Serialized BM25 index
+├── .streamlit/
+│   └── secrets.toml.example    # Streamlit secrets template (AWS creds + optional eval key)
 ├── catalog.json                # Book metadata and pricing inputs
 ├── prompts.yaml                # Router, expansion, and synthesis prompts
 ├── pyproject.toml              # Python dependencies

@@ -880,19 +880,18 @@ The interview-ready highlight reel:
 
 ---
 
-## 14. What's next (Phases 8–9)
-
-This document grows with the project. Planned additions:
+## 14. Status + what's next
 
 - **Phase 7 — Observability + guardrails on cost.** ✅ Done and verified live: Langfuse
   tracing in the service (optional); CloudWatch alarms (error rate, p95 latency); a
   standing AWS Budget (~\$5/mo). See §6 for the full verification story.
-- **Phase 8 — Streamlit integration.** ✅ Done. An env/secrets toggle lets the Streamlit app
-  call the deployed Function URL (SigV4-signed) instead of running the pipeline locally, with
-  graceful degradation when the stack is torn down. See §15 below.
-- **Phase 9 — Final hardening + this doc made exhaustive.** Scoped least-privilege IAM to
-  replace `AdministratorAccess`; complete the architecture/runbook/cost/observability
-  reference.
+- **Phase 8 — Streamlit integration.** ✅ Done and verified live end-to-end. An env/secrets
+  toggle lets the Streamlit app call the deployed Function URL (SigV4-signed) instead of
+  running the pipeline locally, with graceful degradation when the stack is torn down. See §15.
+- **Phase 9 — Final hardening + this doc made exhaustive.** ✅ Largely done: this doc plus the
+  README, `aws-deployment.md`, and `infra/README.md` now cover architecture, the deploy/teardown
+  runbook, cost, secrets, and observability. **One item is deliberately deferred** — scoping the
+  human `citementor-deploy` bootstrap user off `AdministratorAccess` (see §16).
 
 ### The demo flow — run everything from GitHub (Phase 6 ✅, Phase 8 ✅)
 
@@ -973,6 +972,24 @@ bash infra/streamlit_user.sh          # prints a ready-to-paste [aws] secrets bl
 Rotate the key any time with `bash infra/streamlit_user.sh --rotate`. `master`'s app has no
 `[aws]` secret, so it stays local no matter what.
 
+**Optional — Live DeepEval in remote mode.** Add a top-level `OPENAI_API_KEY` to the app's
+Streamlit secrets (above the `[aws]` table) to enable the 🔬 Live DeepEval toggle. Grading runs
+*in the Streamlit process* against the sources the Lambda returns, so it only needs an OpenAI
+key — reuse the same one the Lambda uses. Once an eval runs, the RAG Dashboard shows the
+faithfulness/relevance scores.
+
+### Two 403 gotchas we hit (so you don't have to)
+
+- **`lambda:InvokeFunction` is required, not just `lambda:InvokeFunctionUrl`.** Since October
+  2025, invoking an `AWS_IAM` function URL needs **both**. A URL created after that returns
+  `403 {"Message":"Forbidden"}` with `InvokeFunctionUrl` alone — and the IAM policy simulator
+  *won't* flag it, because `InvokeFunctionUrl` on its own genuinely is allowed. `streamlit_user.sh`
+  grants both.
+- **Intermittent 403s right after an IAM change are propagation, not a bug.** IAM is eventually
+  consistent; for a few minutes after editing the policy the same key can get `200` then `403`.
+  Wait a few minutes and it settles. (A *consistent* 403 is a real permission gap; an *intermittent*
+  one is propagation.)
+
 ### Graceful degradation
 
 When the stack is torn down, `GetFunctionUrlConfig` returns `ResourceNotFoundException`; the
@@ -980,4 +997,36 @@ client raises `BackendOfflineError` and the chat shows *"The AWS backend is curr
 (scaled to \$0). Bring it up via GitHub → Actions → Deploy…"* instead of erroring out. First
 call after a deploy pays the ~40–50s cold start; the client timeout (130s) allows for it.
 
-> _Last updated: 2026-07-12 — covers Phases 0–8 + the Bedrock inference mode._
+---
+
+## 16. Deferred hardening — scope the `citementor-deploy` bootstrap user
+
+The one intentionally-unfinished item. Today the human admin identity
+(`citementor-deploy`) carries `AdministratorAccess`. Everything that runs *automatically or
+continuously* is already least-privilege:
+
+- **CI/CD** (`terraform apply`/`destroy`) runs as the scoped `citementor-github-actions` role
+  (`infra/bootstrap.sh`), trusted only by this repo's `aws-deploy` branch via OIDC.
+- **The Lambda** runs as `citementor-lambda-role` — read one secret, write its own logs.
+- **The Streamlit UI** authenticates as `citementor-streamlit` — discover + invoke one function.
+
+So the residual broad access is limited to a human running one-time setup (`bootstrap.sh`,
+`streamlit_user.sh`) and ad-hoc admin. Scoping it further is genuinely hard — bootstrap
+*creates* IAM roles, an OIDC provider, and a budget, which needs broad IAM — and it can't be
+validated without standing the whole stack back up. It's deferred deliberately, not forgotten.
+
+**When you do it**, replace `AdministratorAccess` with a customer-managed policy covering only
+what bootstrap + local ops touch, roughly:
+
+- `iam:*` scoped to `role/citementor-*`, `user/citementor-*`, and the GitHub OIDC provider ARN.
+- `s3:*` on the `citementor-tfstate-*` state bucket.
+- `budgets:*`, plus the same Lambda/ECR/Secrets/Logs/SNS/CloudWatch actions the CI role has.
+- `sts:GetCallerIdentity`, `lambda:GetFunctionUrlConfig`, `lambda:InvokeFunctionUrl`,
+  `lambda:InvokeFunction` (for `demo_query.sh`).
+
+Apply it to a *fresh* test principal first, run one full deploy→demo→destroy cycle, and only
+then swap the admin user over — keeping a break-glass admin path in case bootstrap needs a
+permission the scoped policy missed.
+
+> _Last updated: 2026-07-12 — covers Phases 0–9 (serverless build, CI/CD, observability,
+> Streamlit-over-Lambda) + the Bedrock inference mode. Remaining: §16 admin-user scoping._
