@@ -2,7 +2,10 @@
 
 ### *Pay only for the wisdom you use.*
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://aws-agentic-rag-citementor2.streamlit.app/) ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+
+AWS backend demo: [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://aws-agentic-rag-citementor2.streamlit.app/)
+
+Streamlit only demo: [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://agentic-rag-citementor2.streamlit.app/)
 
 ## Executive Overview
 
